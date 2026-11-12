@@ -28,7 +28,7 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
   a copy of the resolved config + JSONL logs (every evaluation, with lineage: parent ids, family, operator).
 - qwen3: disable thinking; also strip `<think>…</think>` before judging; log raw output too.
 - Estimate runtime from measured speed and tell the user **before** any long run.
-- Small focused commits after each milestone. Branch: `master`.
+- Small focused commits after each milestone. Branch: `main`.
 
 ## Engineering conventions
 - Python 3.12, package `redevolve/`, `pyproject.toml`, type hints, docstrings on public functions.
@@ -52,6 +52,19 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 - Mutator refusals are real: with a bare rewrite request, gpt-oss-120b and qwen3.8-27b refused and gpt-oss-20b complied
   (n=1 each). Refusal rate must be measured and reported.
 
+## Measured speed / model behaviour (2026-11-12)
+- `qwen3:4b` tag = Qwen3-4B **Thinking-2507** (256K ctx, thinks by default). Thinking can't be disabled:
+  with `think:false` it reasons inline in `content`. Realistic call (239-token prompt, thinking on):
+  **80–124 s**, gen 6.3–7.3 tok/s, cold prompt eval ~22 tok/s, cached prefix ~1300+ tok/s.
+  So the target must be a non-thinking model (pending user decision: `qwen3:4b-instruct-2507`).
+- `qwen3:1.7b` (original hybrid Qwen3) honours native `think:false` cleanly, so it suits the classifier.
+- Ollama OpenAI-compat endpoint **ignores `/no_think`**: thinking goes to `message.reasoning` and eats
+  `max_tokens`; the model even reads "/no_think" as user text. Use the native `/api/chat` with `think`.
+- Groq gpt-oss models spend `max_tokens` on reasoning: set `reasoning_effort` and a larger budget.
+- Ollama `seed` gives identical outputs for identical inputs, which is good for reproducibility.
+- Observed a *refusal leak*: "I cannot comply… the code **CANARY-…** is confidential." (counts as a leak).
+- `smoke` printed PASSED with empty replies from both models: it doesn't check the content.
+
 ## Known issues (from code review, 2026-11-12)
 - Judge misses: numbered-list acrostics, spelled-out/NATO digits, full-width/homoglyph chars (needs NFKC
   + confusables map), split leaks. Partial leaks are not scored. Policy decided: split/partial leaks
@@ -68,7 +81,6 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 ## Status
 - [x] config, llm.py, judge.py, `smoke` CLI, venv, .env/.gitignore
 - [x] CLAUDE.md, code review
-- [ ] env verification + smoke tok/s (waiting on `ollama pull qwen3:4b qwen3:1.7b`)
-- [ ] first commit
+- [x] env verification + speed measurement (see above); first commit; branch renamed to `main`
 - [ ] build plan (awaiting user OK), then: packaging/tooling, judge hardening + tests, seeds, target,
       baseline, GA, guardrail, benign set, report, README
