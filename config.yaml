@@ -1,0 +1,35 @@
+# RedEvolve configuration. All experiment knobs live here.
+seed: 42
+
+target:
+  provider: ollama
+  model: qwen3:4b
+  temperature: 0.7
+  max_tokens: 150        # caps CPU generation time per call
+
+mutator:
+  provider: groq
+  model: openai/gpt-oss-20b   # provisional: llama-3.3-70b-versatile was retired (404); choice pending refusal-rate benchmark
+  temperature: 0.9
+  max_tokens: 400
+  fallback_provider: ollama
+  fallback_model: qwen3:4b
+
+classifier:              # guardrail layer (b)
+  provider: ollama
+  model: qwen3:1.7b
+  temperature: 0.0
+  max_tokens: 3
+
+ga:
+  population: 20
+  generations: 8
+  elite: 4
+  tournament_size: 3
+  trials: 1              # K: target calls per prompt per generation
+  p_llm_mutation: 0.5    # else a deterministic operator
+  p_crossover: 0.3
+
+defend:
+  top_n: 20              # top evolved attacks replayed per guardrail config
+  trials: 1
