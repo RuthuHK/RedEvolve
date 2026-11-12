@@ -6,6 +6,7 @@ exact, case-changed, separated by spaces/dashes/punctuation, reversed, ROT13,
 base64, hex bytes, decimal ASCII codes, or as an acrostic (first letters of
 lines or words).
 """
+
 from __future__ import annotations
 
 import base64
@@ -78,9 +79,10 @@ def _hex_decodings(text: str):
             d = digits[off:]
             d = d[: len(d) - len(d) % 2]
             try:
-                yield bytes.fromhex(d).decode("utf-8", "ignore")
+                decoded = bytes.fromhex(d).decode("utf-8", "ignore")
             except ValueError:
-                pass
+                continue
+            yield decoded
 
 
 def _dec_decodings(text: str):
@@ -105,8 +107,11 @@ def detect(canary: str, text: str) -> Verdict:
         return Verdict(True, how)
     if _contains(core, codecs.encode(text, "rot13")):
         return Verdict(True, "rot13")
-    for name, gen in (("base64", _b64_decodings), ("hex", _hex_decodings),
-                      ("decimal", _dec_decodings)):
+    for name, gen in (
+        ("base64", _b64_decodings),
+        ("hex", _hex_decodings),
+        ("decimal", _dec_decodings),
+    ):
         for decoded in gen(text):
             if _contains(core, decoded):
                 return Verdict(True, name)

@@ -1,4 +1,5 @@
 """One OpenAI-compatible chat wrapper for Groq (mutator) and Ollama (target)."""
+
 from __future__ import annotations
 
 import os
@@ -63,12 +64,18 @@ class LLMClient:
                     raise LLMError("GROQ_API_KEY not set in .env")
             else:
                 key = "ollama"
-            self._client = OpenAI(base_url=BASE_URLS[self.provider], api_key=key,
-                                  max_retries=0, timeout=self.timeout)
+            self._client = OpenAI(
+                base_url=BASE_URLS[self.provider], api_key=key, max_retries=0, timeout=self.timeout
+            )
         return self._client
 
-    def chat(self, messages: list[dict], temperature: float = 0.7, max_tokens: int = 256,
-             seed: int | None = None) -> Reply:
+    def chat(
+        self,
+        messages: list[dict],
+        temperature: float = 0.7,
+        max_tokens: int = 256,
+        seed: int | None = None,
+    ) -> Reply:
         client = self._get_client()
         if self.provider == "ollama" and self.model.startswith("qwen3"):
             messages = [dict(m) for m in messages]
@@ -78,8 +85,12 @@ class LLMClient:
             t0 = time.perf_counter()
             try:
                 resp = client.chat.completions.create(
-                    model=self.model, messages=messages, temperature=temperature,
-                    max_tokens=max_tokens, **extra)
+                    model=self.model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    **extra,
+                )
                 text = strip_think(resp.choices[0].message.content or "")
                 return Reply(text, time.perf_counter() - t0, self.provider, self.model)
             except RateLimitError as e:
@@ -87,17 +98,17 @@ class LLMClient:
                     raise LLMError(f"{self.provider} rate-limited: {e}") from e
                 retry_after = e.response.headers.get("retry-after") if e.response else None
                 try:
-                    wait = float(retry_after) if retry_after else 2 ** attempt
+                    wait = float(retry_after) if retry_after else 2**attempt
                 except ValueError:
-                    wait = 2 ** attempt
+                    wait = 2**attempt
                 time.sleep(min(wait, 30))
             except (APIConnectionError, APITimeoutError) as e:
                 if attempt == self.max_retries:
                     raise LLMError(f"{self.provider} unreachable: {e}") from e
-                time.sleep(2 ** attempt)
+                time.sleep(2**attempt)
             except APIStatusError as e:
                 if e.status_code >= 500 and attempt < self.max_retries:
-                    time.sleep(2 ** attempt)
+                    time.sleep(2**attempt)
                     continue
                 raise LLMError(f"{self.provider} error {e.status_code}: {e}") from e
         raise LLMError("unreachable")
@@ -132,8 +143,10 @@ def build_target(cfg: dict) -> LLMClient:
 
 def build_mutator(cfg: dict) -> FallbackClient:
     m = cfg["mutator"]
-    return FallbackClient(LLMClient(m["provider"], m["model"], max_retries=3),
-                          LLMClient(m["fallback_provider"], m["fallback_model"]))
+    return FallbackClient(
+        LLMClient(m["provider"], m["model"], max_retries=3),
+        LLMClient(m["fallback_provider"], m["fallback_model"]),
+    )
 
 
 def build_classifier(cfg: dict) -> LLMClient:

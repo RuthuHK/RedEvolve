@@ -35,13 +35,21 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 - `ruff` (lint + format), `pytest` with **all LLM calls mocked**; GitHub Actions runs ruff + pytest.
 - CLI: `python -m redevolve <smoke|baseline|evolve|defend|report|all> [--config PATH]`.
 - Windows dev machine: use the venv at `.venv/Scripts/python.exe`.
+- Setup: `pip install -r requirements-lock.txt && pip install -e ".[dev]" --no-deps`. `pyproject.toml` holds
+  compatible ranges (`~=`); `requirements-lock.txt` (pip freeze) holds exact versions. Regenerate the lock after
+  any dependency change: `pip freeze --exclude-editable > requirements-lock.txt`.
+- Checks before each commit: `ruff check . && ruff format --check . && pytest` (same as CI, `.github/workflows/ci.yml`).
+- Config is read from `./config.yaml` (cwd) or `--config`; `redevolve.config.load_config` raises `ConfigError`.
+- License: not chosen yet (user decision, before publishing).
 
 ## Architecture (current files)
 - `redevolve/llm.py`: `LLMClient` (OpenAI-compatible client for Groq + Ollama, retries/backoff,
   `strip_think`), `FallbackClient` (Groq → Ollama), `build_target/build_mutator/build_classifier`.
 - `redevolve/judge.py`: `make_canary`, `detect(canary, text) -> Verdict(leaked, method)`.
   Detects plain/case/separators/zero-width, reversed, ROT13, base64 (all offsets, 2 layers), hex, decimal ASCII, acrostics.
-- `redevolve/cli.py`: `smoke` only (judge self-check, Groq ping, Ollama ping + tok/s).
+- `redevolve/config.py`: `load_config(path=None)`, `ConfigError`.
+- `redevolve/cli.py`: `smoke` only (judge self-check, Groq ping, Ollama ping + tok/s). Exit 2 on config error.
+- `tests/`: `test_config.py`. CI: `.github/workflows/ci.yml` (ruff lint + format check + pytest, Python 3.12).
 
 ## Environment facts (verified 2026-11-12)
 - Windows 11, Python 3.12, 31.6 GB RAM, no GPU. Ollama 0.40.15.
@@ -56,7 +64,13 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 - `qwen3:4b` tag = Qwen3-4B **Thinking-2507** (256K ctx, thinks by default). Thinking can't be disabled:
   with `think:false` it reasons inline in `content`. Realistic call (239-token prompt, thinking on):
   **80–124 s**, gen 6.3–7.3 tok/s, cold prompt eval ~22 tok/s, cached prefix ~1300+ tok/s.
-  So the target must be a non-thinking model (pending user decision: `qwen3:4b-instruct-2507`).
+  The thinking tag has been removed from the machine.
+- **Target = `qwen3:4b-instruct-2507-q4_K_M`** (non-thinking). Measured on 8 attack styles, 1 run each, seed 42,
+  uncapped (600): gen **9–11 tok/s**, prompt ~110 tok (~1 s), wall **4–29 s/call** (median ~10 s), longest reply 228 tok.
+  2/8 leaked (summarise, translate), first detected at **token 34–36** (streamed judge).
+- **Decision: target `max_tokens: 200`.** Full leaks appear by ~36 tokens; encoded/acrostic leaks need ~120
+  (8–15 lines × ~8 tok). 200 leaves headroom with a worst case of ~20 s of generation. Truncated replies are flagged
+  and their rate reported; revisit if leaks get cut off. Evidence is small (n=8).
 - `qwen3:1.7b` (original hybrid Qwen3) honours native `think:false` cleanly, so it suits the classifier.
 - Ollama OpenAI-compat endpoint **ignores `/no_think`**: thinking goes to `message.reasoning` and eats
   `max_tokens`; the model even reads "/no_think" as user text. Use the native `/api/chat` with `think`.
@@ -73,8 +87,8 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
   None content); prefer Ollama's native `think: false`. Truncated thinking leaves an empty answer and silently
   counts as a non-leak, so truncation must be flagged. No client-side throttle, no cache, no token usage.
   FallbackClient disables Groq permanently after 3 failures (should be a cooldown). `load_dotenv()` loads implicitly on import.
-- `cli.py`: `ROOT` is derived from `__file__` (breaks once installed); unused import `build_mutator`;
-  the judge self-test belongs in pytest.
+- `cli.py`: the judge self-test belongs in pytest (M3); smoke must check the reply content (M2).
+  (Fixed in M1: config path and the unused import.)
 - `make_canary` defaults to OS randomness. Plan: derive it from the run seed and record it in the run config.
 - `trials: 1` is too low; size K from measured speed.
 
@@ -82,5 +96,18 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 - [x] config, llm.py, judge.py, `smoke` CLI, venv, .env/.gitignore
 - [x] CLAUDE.md, code review
 - [x] env verification + speed measurement (see above); first commit; branch renamed to `main`
-- [ ] build plan (awaiting user OK), then: packaging/tooling, judge hardening + tests, seeds, target,
-      baseline, GA, guardrail, benign set, report, README
+- [x] build plan approved (2026-11-12)
+
+## Build plan (approved)
+- [x] M1 tooling: pyproject + lock file, ruff, pytest, GitHub Actions, CLI config path fix
+- [ ] M2 LLM layer: native Ollama `/api/chat` + `think`, raw/reasoning logging, truncation flag; Groq throttle
+      (8k TPM), mutator system prompt, `reasoning_effort`, cache, usage; fallback cooldown; smoke checks content
+- [ ] M3 judge hardening (NFKC/homoglyphs, numbered acrostics, spelled/NATO digits, partial score) + full tests
+- [ ] M4 seeds (30, YAML, 5 families), target wrapper, seed-derived canary, `runs/<run_id>/`, resumable runs
+- [ ] M5 baseline: each seed × K=10, per-attack/family ASR with Wilson 95% CIs
+- [ ] M6 GA + tests (determinism, elitism, selection), mutator-refusal fallback + logged refusal rate
+- [ ] M7 evolve: **seed 1 + random-search control (equal budget) only for v1**
+- [ ] M8 guardrail (3 layers, paired ablation: one target call per attack×trial, 8 configs derived), 50 benign prompts
+- [ ] M9 report.py + README
+- [ ] M10 publish v1: gitleaks scan of full history, resume bullet (real numbers), GitHub steps
+- [ ] v1.1: GA seeds 2 and 3, report regenerated

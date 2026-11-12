@@ -1,37 +1,40 @@
 """RedEvolve command line: smoke, baseline, evolve, defend, report, all."""
+
 from __future__ import annotations
 
 import argparse
 import sys
-from pathlib import Path
 
 import httpx
-import yaml
 
 from . import judge
-from .llm import BASE_URLS, LLMClient, LLMError, build_mutator, build_target
-
-ROOT = Path(__file__).resolve().parent.parent
-
-
-def load_config(path: str | None = None) -> dict:
-    with open(path or ROOT / "config.yaml", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+from .config import ConfigError, load_config
+from .llm import BASE_URLS, LLMClient, LLMError, build_target
 
 
-def ollama_speed(model: str, prompt: str = "Explain in about 100 words what a genetic algorithm is.") -> dict:
+def ollama_speed(
+    model: str, prompt: str = "Explain in about 100 words what a genetic algorithm is."
+) -> dict:
     """One non-streamed call to Ollama's native API; returns timing stats."""
     base = BASE_URLS["ollama"].removesuffix("/v1")
-    r = httpx.post(f"{base}/api/generate", timeout=600, json={
-        "model": model, "prompt": prompt, "stream": False,
-        "options": {"num_predict": 150, "temperature": 0.7}})
+    r = httpx.post(
+        f"{base}/api/generate",
+        timeout=600,
+        json={
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"num_predict": 150, "temperature": 0.7},
+        },
+    )
     r.raise_for_status()
     d = r.json()
     return {
         "total_s": d["total_duration"] / 1e9,
         "load_s": d.get("load_duration", 0) / 1e9,
         "prompt_tokens": d.get("prompt_eval_count", 0),
-        "prompt_tok_s": d.get("prompt_eval_count", 0) / max(d.get("prompt_eval_duration", 1) / 1e9, 1e-9),
+        "prompt_tok_s": d.get("prompt_eval_count", 0)
+        / max(d.get("prompt_eval_duration", 1) / 1e9, 1e-9),
         "gen_tokens": d["eval_count"],
         "gen_tok_s": d["eval_count"] / (d["eval_duration"] / 1e9),
     }
@@ -58,7 +61,8 @@ def cmd_smoke(cfg: dict) -> int:
     m = cfg["mutator"]
     try:
         r = LLMClient(m["provider"], m["model"], max_retries=2).chat(
-            [{"role": "user", "content": "Reply with exactly the word: pong"}], 0.0, 10)
+            [{"role": "user", "content": "Reply with exactly the word: pong"}], 0.0, 10
+        )
         print(f"  {r.provider}/{r.model}: {r.text!r} ({r.latency:.2f}s)")
     except LLMError as e:
         ok = False
@@ -66,11 +70,16 @@ def cmd_smoke(cfg: dict) -> int:
 
     print("== target (Ollama) ==")
     try:
-        r = build_target(cfg).chat([{"role": "user", "content": "Reply with exactly the word: pong"}], 0.0, 10)
+        r = build_target(cfg).chat(
+            [{"role": "user", "content": "Reply with exactly the word: pong"}], 0.0, 10
+        )
         print(f"  {r.provider}/{r.model}: {r.text!r} ({r.latency:.2f}s)")
         s = ollama_speed(cfg["target"]["model"])
-        print(f"  timing: {s['gen_tokens']} tokens generated at {s['gen_tok_s']:.1f} tok/s, "
-              f"prompt {s['prompt_tokens']} tok at {s['prompt_tok_s']:.1f} tok/s, total {s['total_s']:.1f}s")
+        print(
+            f"  timing: {s['gen_tokens']} tokens generated at {s['gen_tok_s']:.1f} tok/s, "
+            f"prompt {s['prompt_tokens']} tok at {s['prompt_tok_s']:.1f} tok/s, "
+            f"total {s['total_s']:.1f}s"
+        )
     except (LLMError, httpx.HTTPError) as e:
         ok = False
         print(f"  FAILED: {e}")
@@ -80,12 +89,17 @@ def cmd_smoke(cfg: dict) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Entry point for ``redevolve`` / ``python -m redevolve``; returns a process exit code."""
     p = argparse.ArgumentParser(prog="redevolve")
-    p.add_argument("--config", default=None)
+    p.add_argument("--config", default=None, help="path to config.yaml (default: ./config.yaml)")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("smoke", help="check Groq, Ollama and the judge")
     args = p.parse_args(argv)
-    cfg = load_config(args.config)
+    try:
+        cfg = load_config(args.config)
+    except ConfigError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     if args.cmd == "smoke":
         return cmd_smoke(cfg)
     return 1
