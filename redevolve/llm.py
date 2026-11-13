@@ -38,7 +38,28 @@ _MAX_WAIT_S = 60.0
 
 
 class LLMError(RuntimeError):
-    """A chat call failed after retries (or failed in a non-retryable way)."""
+    """A chat call failed. Base class; see the two subclasses for how to react."""
+
+
+class LLMUnavailable(LLMError):
+    """The service itself is unavailable: retries were exhausted on network errors,
+    429s or 5xx, or a daily quota is used up. Retrying the same request soon won't help.
+
+    Attributes:
+        daily_limit: True if the provider said a per-day quota is exhausted.
+    """
+
+    def __init__(self, message: str, *, daily_limit: bool = False) -> None:
+        super().__init__(message)
+        self.daily_limit = daily_limit
+
+
+class LLMRequestError(LLMError):
+    """This particular request failed (non-429 4xx, malformed response); the service is up."""
+
+
+# Groq's 429 body names the exhausted window, e.g. "... on requests per day (RPD) ...".
+_DAILY_LIMIT_RE = re.compile(r"per\s+day|\bRPD\b|\bTPD\b", re.I)
 
 
 class _Secret:
@@ -168,35 +189,58 @@ def _post_with_retries(
     provider: str,
     sleep: Callable[[float], None],
 ) -> httpx.Response:
-    """POST with retries on connection errors, timeouts, 429 and 5xx; fail fast on other 4xx."""
+    """POST with retries on connection errors, timeouts, 429 and 5xx; fail fast on other 4xx.
+
+    Raises:
+        LLMUnavailable: retries exhausted, or a daily quota is exhausted (not retried,
+            since it won't reset within any sensible backoff).
+        LLMRequestError: any other 4xx.
+    """
     for attempt in range(max_retries + 1):
         last = attempt == max_retries
         try:
             r = http.post(url, json=payload, headers=headers)
         except httpx.TransportError as e:  # includes timeouts and connection errors
             if last:
-                raise LLMError(f"{provider} unreachable: {type(e).__name__}: {e}") from e
+                raise LLMUnavailable(f"{provider} unreachable: {type(e).__name__}: {e}") from e
             sleep(_backoff(attempt))
             continue
+        if r.status_code == 429 and _DAILY_LIMIT_RE.search(r.text):
+            raise LLMUnavailable(
+                f"{provider} daily quota exhausted: {_snippet(r)}", daily_limit=True
+            )
         if r.status_code == 429 or r.status_code >= 500:
             if last:
-                raise LLMError(
+                raise LLMUnavailable(
                     f"{provider} HTTP {r.status_code} after {attempt + 1} attempts: {_snippet(r)}"
                 )
             wait = _retry_after(r)
             sleep(wait if wait is not None else _backoff(attempt))
             continue
         if r.status_code >= 400:
-            raise LLMError(f"{provider} HTTP {r.status_code}: {_snippet(r)}")
+            raise LLMRequestError(f"{provider} HTTP {r.status_code}: {_snippet(r)}")
         return r
     raise AssertionError("unreachable")  # pragma: no cover
+
+
+class _LazyHTTP:
+    """Creates the httpx client on first use (construction loads TLS certificates, ~0.3 s)."""
+
+    def __init__(self, client: httpx.Client | None, timeout_s: float) -> None:
+        self._client = client
+        self._timeout_s = timeout_s
+
+    def get(self) -> httpx.Client:
+        if self._client is None:
+            self._client = httpx.Client(timeout=self._timeout_s)
+        return self._client
 
 
 def _json(r: httpx.Response, provider: str) -> dict[str, Any]:
     try:
         return r.json()
     except (json.JSONDecodeError, ValueError) as e:
-        raise LLMError(f"{provider} returned non-JSON: {_snippet(r)}") from e
+        raise LLMRequestError(f"{provider} returned non-JSON: {_snippet(r)}") from e
 
 
 class OllamaClient:
@@ -232,7 +276,7 @@ class OllamaClient:
         self.think = think
         self.keep_alive = keep_alive
         self.max_retries = max_retries
-        self._http = http or httpx.Client(timeout=timeout_s)
+        self._http = _LazyHTTP(http, timeout_s)
         self._sleep = sleep
 
     def __repr__(self) -> str:
@@ -261,7 +305,7 @@ class OllamaClient:
             payload["think"] = self.think
         t0 = time.perf_counter()
         r = _post_with_retries(
-            self._http,
+            self._http.get(),
             f"{self.base_url}/api/chat",
             payload=payload,
             headers=None,
@@ -327,7 +371,7 @@ class GroqClient:
         self.limiter = limiter
         self.max_retries = max_retries
         self._api_key = _Secret(api_key)
-        self._http = http or httpx.Client(timeout=timeout_s)
+        self._http = _LazyHTTP(http, timeout_s)
         self._sleep = sleep
 
     def __repr__(self) -> str:
@@ -365,7 +409,7 @@ class GroqClient:
         )
         t0 = time.perf_counter()
         r = _post_with_retries(
-            self._http,
+            self._http.get(),
             f"{self.base_url}/chat/completions",
             payload=payload,
             headers={"Authorization": f"Bearer {self._api_key.reveal()}"},
@@ -379,7 +423,7 @@ class GroqClient:
             choice = d["choices"][0]
             msg = choice["message"]
         except (KeyError, IndexError, TypeError) as e:
-            raise LLMError(f"groq response missing choices: {_snippet(r)}") from e
+            raise LLMRequestError(f"groq response missing choices: {_snippet(r)}") from e
         usage = d.get("usage") or {}
         if slot is not None:
             RateLimiter.settle(slot, usage.get("total_tokens"))
@@ -545,12 +589,25 @@ def build_groq(cfg: dict[str, Any], api_key: str | None) -> GroqClient:
     )
 
 
-def build_mutator(cfg: dict[str, Any], api_key: str | None) -> FallbackClient:
-    """Build the mutator: cached, rate-limited Groq, falling back to a local Ollama model."""
+def build_mutator(
+    cfg: dict[str, Any], api_key: str | None, *, allow_fallback: bool = False
+) -> ChatClient:
+    """Build the mutator client: rate-limited Groq, cached if ``mutator.cache`` is set.
+
+    Args:
+        cfg: Full config.
+        api_key: Groq API key.
+        allow_fallback: If False (the default, and the only mode for experiment runs),
+            a Groq outage surfaces as :class:`LLMUnavailable` so the run can pause and
+            be resumed, and one run never mixes mutator models. If True (dev/smoke
+            only), failures are answered by the local ``mutator.fallback_model``.
+    """
     m = cfg["mutator"]
     primary: ChatClient = build_groq(cfg, api_key)
     if m.get("cache"):
         primary = CachedClient(primary, ResponseCache(m["cache"]), namespace="mutator")
+    if not allow_fallback:
+        return primary
     fallback = _ollama_from({"think": False}, cfg.get("ollama", {}), m["fallback_model"])
     return FallbackClient(
         primary,

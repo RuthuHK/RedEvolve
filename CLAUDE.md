@@ -29,6 +29,13 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 - qwen3: disable thinking; also strip `<think>…</think>` before judging; log raw output too.
 - Estimate runtime from measured speed and tell the user **before** any long run.
 - Small focused commits after each milestone. Branch: `main`.
+- **One run = one mutator model.** Experiment runs (evolve/control) build the mutator with
+  `build_mutator(cfg, key)` (strict, no fallback). On `MutatorUnavailable` (outage or daily quota) the run must
+  checkpoint and stop with a resume hint, never switch models. On resume, refuse if the config's mutator model differs
+  from the one recorded in the run. The local fallback (`allow_fallback=True`) is for dev/smoke only.
+- Every GA child records its provenance: operator, parent ids, family, and for LLM mutations the `MutationOutcome`
+  (status, producing `provider/model`, cached). A refused/invalid/error LLM mutation falls back to a deterministic
+  operator, recorded as such. Each run reports `MutatorStats` (refusal rate, failure rate, models used, cache hits).
 
 ## Engineering conventions
 - Python 3.12, package `redevolve/`, `pyproject.toml`, type hints, docstrings on public functions.
@@ -49,6 +56,13 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
   repr/vars), `CachedClient`, `FallbackClient` (cooldown, not permanent), `load_groq_key()` (explicit; nothing loads
   on import), `build_target/build_classifier/build_groq/build_mutator(cfg, key)`.
   Retries: network/timeout/429/5xx with backoff (retry-after honoured, capped at 60 s); other 4xx fail fast.
+- Errors: `LLMError` base; `LLMUnavailable` (retries exhausted on network/429/5xx, or daily quota, with `daily_limit`
+  flag; daily-limit 429s are not retried) vs `LLMRequestError` (non-429 4xx, malformed response).
+  `build_mutator(cfg, key, *, allow_fallback=False)`. httpx clients are created lazily (cert loading is ~0.3 s).
+- `redevolve/mutator.py`: `LLMMutator.rewrite/crossover(..., seed) -> MutationOutcome`, `MutatorStats`,
+  `MutatorUnavailable`, `MutationStatus` (ok/refused/invalid/error).
+- Mutator cache key = namespace + provider + model + reasoning_effort + full messages (system + user, with roles) +
+  temperature + max_tokens + seed (tested field by field in `test_cache_key_covers_every_request_field`).
 - `redevolve/ratelimit.py`: sliding-window `RateLimiter(rpm, tpm)`; `acquire(est)` then `settle(slot, actual)`.
 - `redevolve/cache.py`: SQLite `ResponseCache` + `cache_key()`; mutator cache at `.cache/mutator.sqlite` (git-ignored).
 - `redevolve/mutator_prompts.py`: mutator system prompt, rewrite/crossover templates, `extract_prompt()`
@@ -61,7 +75,7 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 - `redevolve/cli.py`: `smoke` (judge sanity, pong checks that verify content/truncation for mutator, target and
   classifier, plus 3 realistic target timing calls). Exit 2 on config error.
 - `tests/`: helpers.py (FakeClock, Scripted httpx MockTransport), test_config, test_llm, test_ratelimit,
-  test_cache, test_mutator_prompts, test_smoke (87 tests, no network). CI: `.github/workflows/ci.yml` (ruff lint + format check + pytest, Python 3.12).
+  test_cache, test_mutator, test_mutator_prompts, test_smoke (112 tests, ~2 s, no network). CI: `.github/workflows/ci.yml` (ruff lint + format check + pytest, Python 3.12).
 
 ## Environment facts (verified 2026-11-12)
 - Windows 11, Python 3.12, 31.6 GB RAM, no GPU. Ollama 0.40.15.

@@ -41,7 +41,7 @@ class Scripted:
         return step
 
     def client(self) -> httpx.Client:
-        return httpx.Client(transport=httpx.MockTransport(self.handler))
+        return httpx.Client(transport=httpx.MockTransport(self.handler), trust_env=False)
 
     def body(self, i: int = -1) -> dict[str, Any]:
         return json.loads(self.requests[i].content)

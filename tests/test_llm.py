@@ -14,6 +14,8 @@ from redevolve.llm import (
     FallbackClient,
     GroqClient,
     LLMError,
+    LLMRequestError,
+    LLMUnavailable,
     OllamaClient,
     load_groq_key,
     strip_think,
@@ -195,10 +197,50 @@ def test_groq_retry_after_is_capped() -> None:
     assert sleeps == [60.0]
 
 
-def test_groq_persistent_429_raises() -> None:
+def test_groq_persistent_429_is_unavailable() -> None:
     s = Scripted([httpx.Response(429)] * 3)
-    with pytest.raises(LLMError, match="429"):
+    with pytest.raises(LLMUnavailable, match="429") as exc:
         groq(s, max_retries=2).chat(MSGS, temperature=0, max_tokens=5)
+    assert not exc.value.daily_limit
+
+
+def test_groq_daily_limit_fails_fast_and_is_flagged() -> None:
+    body = {"error": {"message": "Rate limit reached for model on requests per day (RPD)"}}
+    s = Scripted([httpx.Response(429, json=body)])
+    with pytest.raises(LLMUnavailable) as exc:
+        groq(s, max_retries=5).chat(MSGS, temperature=0, max_tokens=5)
+    assert exc.value.daily_limit
+    assert len(s.requests) == 1  # no pointless retries against a daily cap
+
+
+def test_network_exhaustion_is_unavailable_but_400_is_request_error() -> None:
+    with pytest.raises(LLMUnavailable):
+        groq(Scripted([httpx.ConnectError("x")] * 2), max_retries=1).chat(
+            MSGS, temperature=0, max_tokens=5
+        )
+    with pytest.raises(LLMRequestError):
+        groq(Scripted([httpx.Response(400, text="bad")])).chat(MSGS, temperature=0, max_tokens=5)
+
+
+def test_build_mutator_strict_by_default_fallback_only_on_request(tmp_path: Path) -> None:
+    from redevolve.llm import build_mutator
+
+    cfg = {
+        "ollama": {},
+        "mutator": {
+            "model": "g",
+            "rpm": 25,
+            "tpm": 7000,
+            "cache": str(tmp_path / "c.sqlite"),
+            "fallback_model": "local",
+        },
+    }
+    strict = build_mutator(cfg, FAKE_KEY)
+    assert isinstance(strict, CachedClient)
+    assert not isinstance(strict, FallbackClient)
+    dev = build_mutator(cfg, FAKE_KEY, allow_fallback=True)
+    assert isinstance(dev, FallbackClient)
+    assert dev.fallback.model == "local"
 
 
 def test_groq_missing_choices_is_llm_error() -> None:
@@ -258,6 +300,70 @@ def test_cache_key_depends_on_seed_and_params(tmp_path: Path) -> None:
     c.chat(MSGS, temperature=0.9, max_tokens=50, seed=2)
     c.chat(MSGS, temperature=0.5, max_tokens=50, seed=1)
     assert len(s.requests) == 3
+
+
+BASE_REQ = {
+    "model": "openai/gpt-oss-20b",
+    "reasoning_effort": "low",
+    "messages": [{"role": "system", "content": "SYS"}, {"role": "user", "content": "PROMPT"}],
+    "temperature": 0.9,
+    "max_tokens": 800,
+    "seed": 1,
+}
+VARIANTS = {
+    "model": {"model": "qwen/qwen3.8-27b"},
+    "reasoning_effort": {"reasoning_effort": "medium"},
+    "temperature": {"temperature": 0.8},
+    "max_tokens": {"max_tokens": 801},
+    "seed": {"seed": 2},
+    "seed_none": {"seed": None},
+    "user_prompt": {
+        "messages": [{"role": "system", "content": "SYS"}, {"role": "user", "content": "PROMPT!"}]
+    },
+    "system_prompt": {
+        "messages": [{"role": "system", "content": "SYS2"}, {"role": "user", "content": "PROMPT"}]
+    },
+    "role": {
+        "messages": [{"role": "user", "content": "SYS"}, {"role": "user", "content": "PROMPT"}]
+    },
+}
+
+
+def _cached_call(cache: ResponseCache, script: Scripted, req: dict) -> ChatResult:
+    inner = GroqClient(
+        req["model"],
+        api_key=FAKE_KEY,
+        reasoning_effort=req["reasoning_effort"],
+        http=script.client(),
+        sleep=lambda s: None,
+    )
+    return CachedClient(inner, cache, namespace="mutator").chat(
+        req["messages"],
+        temperature=req["temperature"],
+        max_tokens=req["max_tokens"],
+        seed=req["seed"],
+    )
+
+
+@pytest.mark.parametrize("field", list(VARIANTS))
+def test_cache_key_covers_every_request_field(tmp_path: Path, field: str) -> None:
+    """Changing any one request field must miss the cache, never replay a stale reply."""
+    cache = ResponseCache(tmp_path / "c.sqlite")
+    s = Scripted([groq_ok("original"), groq_ok("fresh")])
+    assert _cached_call(cache, s, BASE_REQ).text == "original"
+    assert _cached_call(cache, s, BASE_REQ).cached  # identical request: hit (sanity check)
+    changed = _cached_call(cache, s, {**BASE_REQ, **VARIANTS[field]})
+    assert not changed.cached
+    assert changed.text == "fresh"
+    assert len(s.requests) == 2
+
+
+def test_cache_namespace_separates_uses(tmp_path: Path) -> None:
+    cache = ResponseCache(tmp_path / "c.sqlite")
+    s = Scripted([groq_ok("a"), groq_ok("b")])
+    CachedClient(groq(s), cache, namespace="x").chat(MSGS, temperature=0, max_tokens=5)
+    r = CachedClient(groq(s), cache, namespace="y").chat(MSGS, temperature=0, max_tokens=5)
+    assert not r.cached
 
 
 def test_cache_does_not_store_failures(tmp_path: Path) -> None:
