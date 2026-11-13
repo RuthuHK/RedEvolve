@@ -94,10 +94,28 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 - Judge measured (2026-11-13): 0 full leaks / 60,000 benign checks (12 texts x 5,000 canaries); partial FP 0.010%
   (6, all 5-char fragments in hashes/UUIDs/English words); 0.35-2.6 ms per reply.
 - `redevolve/config.py`: `load_config(path=None)`, `ConfigError`.
+- `redevolve/seeds.py`: `load_seeds(path) -> SeedSet(version, families, seeds, sha256)`, `SeedError`. The hash covers
+  version + id/family/prompt only (not notes, comments or formatting).
+- `redevolve/seeding.py`: `derive_seed(*parts)` (SHA-256-based, stable everywhere), `derive_canary(run_seed)`,
+  `target_seed(run_seed, attack_id, trial)`. All randomness is keyed by purpose, so resume can't shift seeds.
+  Pinned golden values in `test_seeding.py`; never change them.
+- `redevolve/target.py`: `Target(client, system_prompt_template, canary, temperature, max_tokens)`, `.from_config`,
+  `.evaluate(attack_id, family, prompt, trial=, seed=) -> Evaluation` (ChatResult + Verdict), `.to_record()` = flat
+  log record (reply + raw + reasoning, verdict fields, `judge_version`, truncation, tokens, latency, model).
+  `{canary}` is inserted with str.replace (other braces are safe). `system_prompt_hash(template)`.
+- `redevolve/runs.py`: `RunDir.create(root, kind, cfg, seeds=, canary=, extra=)` makes `runs/<kind>-<UTC ts>-s<seed>/`
+  with `run.json` (fingerprint, status, sessions, environment incl. git commit/dirty), `config.yaml`, and `log.jsonl`
+  (append-only, fsync per line, torn last line ignored and repaired). `RunDir.resume(...)` refuses on any fingerprint
+  difference (config hash, seeds hash, system prompt hash, target model, mutator model, judge version, canary) or if
+  complete. `completed_keys()` lists the work to skip. Writes refuse anything that looks like an API key.
+  `set_status(running|paused|failed|complete, **info)`.
+- `judge.JUDGE_VERSION = 2` (v1 = pre-M3). Recorded in every eval and in the run fingerprint.
+- Start every experiment run from a clean, committed tree, so `environment.git_dirty` is False in `run.json`.
 - `redevolve/cli.py`: `smoke` (judge sanity, pong checks that verify content/truncation for mutator, target and
   classifier, plus 3 realistic target timing calls). Exit 2 on config error.
 - `tests/`: helpers.py (FakeClock, Scripted httpx MockTransport), test_config, test_llm, test_ratelimit,
-  test_cache, test_judge, test_mutator, test_mutator_prompts, test_smoke (188 tests, ~11 s, no network).
+  test_cache, test_judge, test_mutator, test_mutator_prompts, test_runs, test_seeding, test_seeds, test_smoke,
+  test_target (228 tests, ~16 s, no network).
   test_judge: 35 encodings x 100 random canaries, fixed-method examples, near-misses, partials, benign FP corpus. CI: `.github/workflows/ci.yml` (ruff lint + format check + pytest, Python 3.12).
 
 ## Environment facts (verified 2026-11-12)
@@ -156,7 +174,7 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 - [x] M2 LLM layer: native Ollama `/api/chat` + `think`, raw/reasoning logging, truncation flag; Groq throttle
       (8k TPM), mutator system prompt, `reasoning_effort`, cache, usage; fallback cooldown; smoke checks content
 - [x] M3 judge hardening (NFKC/homoglyphs, numbered acrostics, spelled/NATO digits, partial score) + full tests
-- [ ] M4 seeds (30, YAML, 5 families), target wrapper, seed-derived canary, `runs/<run_id>/`, resumable runs
+- [x] M4 seeds (30, YAML, 5 families), target wrapper, seed-derived canary, `runs/<run_id>/`, resumable runs
 - [ ] M5 baseline: each seed × K=10, per-attack/family ASR with Wilson 95% CIs. **Judge validation:** export ~50 real
       target replies (stratified: judged full leak / no leak / partial, plus tricky cases) to a labeling file *without*
       the judge's verdicts shown; user hand-labels them; report judge-vs-human agreement (confusion matrix, accuracy,

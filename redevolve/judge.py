@@ -37,6 +37,11 @@ import unicodedata
 from collections.abc import Iterator
 from dataclasses import dataclass
 
+# Bump on any change to detection rules. Every logged evaluation records it, and results
+# from different judge versions are re-judged from the raw replies rather than mixed.
+# v1: the original (pre-M3) judge. v2: M3 hardening (unicode/leet/spelled/binary/acrostics/partial).
+JUDGE_VERSION = 2
+
 HEX = "0123456789abcdef"
 CANARY_PREFIX = "CANARY-"
 CORE_LEN = 8
