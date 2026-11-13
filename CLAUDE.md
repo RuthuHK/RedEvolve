@@ -36,6 +36,14 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 - Every GA child records its provenance: operator, parent ids, family, and for LLM mutations the `MutationOutcome`
   (status, producing `provider/model`, cached). A refused/invalid/error LLM mutation falls back to a deterministic
   operator, recorded as such. Each run reports `MutatorStats` (refusal rate, failure rate, models used, cache hits).
+- **Seed set is frozen before any baseline run.** After user approval, `data/seeds.yaml` is committed and its content
+  hash is recorded in every run's metadata. **Never edit seeds after seeing results** (that would be tuning the
+  benchmark to the outcome). A changed seed set is a new version with a new hash, and results from different hashes
+  are never pooled or compared as if they were the same benchmark.
+- **Guardrail evaluation uses held-out attacks (M8).** Attacks looked at while designing or tuning the guardrail
+  (the dev set) are reported separately from held-out attacks it was not designed against (e.g. the random-search
+  control's attacks or a separate GA seed's). The headline guardrail numbers come from the held-out set. Decide and
+  record the dev/held-out split before designing the guardrail.
 
 ## Engineering conventions
 - Python 3.12, package `redevolve/`, `pyproject.toml`, type hints, docstrings on public functions.
@@ -143,10 +151,14 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
       (8k TPM), mutator system prompt, `reasoning_effort`, cache, usage; fallback cooldown; smoke checks content
 - [x] M3 judge hardening (NFKC/homoglyphs, numbered acrostics, spelled/NATO digits, partial score) + full tests
 - [ ] M4 seeds (30, YAML, 5 families), target wrapper, seed-derived canary, `runs/<run_id>/`, resumable runs
-- [ ] M5 baseline: each seed × K=10, per-attack/family ASR with Wilson 95% CIs
+- [ ] M5 baseline: each seed × K=10, per-attack/family ASR with Wilson 95% CIs. **Judge validation:** export ~50 real
+      target replies (stratified: judged full leak / no leak / partial, plus tricky cases) to a labeling file *without*
+      the judge's verdicts shown; user hand-labels them; report judge-vs-human agreement (confusion matrix, accuracy,
+      Cohen's kappa) and list every disagreement. Fix judge bugs only as new judge versions, and re-report.
 - [ ] M6 GA + tests (determinism, elitism, selection), mutator-refusal fallback + logged refusal rate
 - [ ] M7 evolve: **seed 1 + random-search control (equal budget) only for v1**
-- [ ] M8 guardrail (3 layers, paired ablation: one target call per attack×trial, 8 configs derived), 50 benign prompts
+- [ ] M8 guardrail (3 layers, paired ablation: one target call per attack×trial, 8 configs derived), 50 benign prompts.
+      Report dev-set and **held-out** attack results separately (see Hard rules); the held-out set is the headline.
 - [ ] M9 report.py + README
 - [ ] M10 publish v1: gitleaks scan of full history, resume bullet (real numbers), GitHub steps
 - [ ] v1.1: GA seeds 2 and 3, report regenerated
