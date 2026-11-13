@@ -43,13 +43,25 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 - License: not chosen yet (user decision, before publishing).
 
 ## Architecture (current files)
-- `redevolve/llm.py`: `LLMClient` (OpenAI-compatible client for Groq + Ollama, retries/backoff,
-  `strip_think`), `FallbackClient` (Groq → Ollama), `build_target/build_mutator/build_classifier`.
+- `redevolve/llm.py` (plain httpx; **no openai SDK**): `ChatResult` (text, raw, reasoning, tokens,
+  finish_reason, `truncated`, gen_tok_s, cached), `ChatClient` protocol, `OllamaClient` (native `/api/chat`,
+  `think`, `keep_alive`), `GroqClient` (rate-limited, `reasoning_effort`, key held in `_Secret` so it is masked in
+  repr/vars), `CachedClient`, `FallbackClient` (cooldown, not permanent), `load_groq_key()` (explicit; nothing loads
+  on import), `build_target/build_classifier/build_groq/build_mutator(cfg, key)`.
+  Retries: network/timeout/429/5xx with backoff (retry-after honoured, capped at 60 s); other 4xx fail fast.
+- `redevolve/ratelimit.py`: sliding-window `RateLimiter(rpm, tpm)`; `acquire(est)` then `settle(slot, actual)`.
+- `redevolve/cache.py`: SQLite `ResponseCache` + `cache_key()`; mutator cache at `.cache/mutator.sqlite` (git-ignored).
+- `redevolve/mutator_prompts.py`: mutator system prompt, rewrite/crossover templates, `extract_prompt()`
+  (`<prompt>` tags; unclosed tag accepted unless truncated), `looks_like_refusal()` (normalises curly apostrophes).
+- `scripts/bench_mutator.py`: Groq mutator usable/refusal benchmark → `results/mutator_bench{.jsonl,_summary.json}`;
+  `--relabel` re-classifies saved replies without API calls.
 - `redevolve/judge.py`: `make_canary`, `detect(canary, text) -> Verdict(leaked, method)`.
   Detects plain/case/separators/zero-width, reversed, ROT13, base64 (all offsets, 2 layers), hex, decimal ASCII, acrostics.
 - `redevolve/config.py`: `load_config(path=None)`, `ConfigError`.
-- `redevolve/cli.py`: `smoke` only (judge self-check, Groq ping, Ollama ping + tok/s). Exit 2 on config error.
-- `tests/`: `test_config.py`. CI: `.github/workflows/ci.yml` (ruff lint + format check + pytest, Python 3.12).
+- `redevolve/cli.py`: `smoke` (judge sanity, pong checks that verify content/truncation for mutator, target and
+  classifier, plus 3 realistic target timing calls). Exit 2 on config error.
+- `tests/`: helpers.py (FakeClock, Scripted httpx MockTransport), test_config, test_llm, test_ratelimit,
+  test_cache, test_mutator_prompts, test_smoke (87 tests, no network). CI: `.github/workflows/ci.yml` (ruff lint + format check + pytest, Python 3.12).
 
 ## Environment facts (verified 2026-11-12)
 - Windows 11, Python 3.12, 31.6 GB RAM, no GPU. Ollama 0.40.15.
@@ -57,8 +69,13 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
   The TPM cap is binding (~25 mutations/min at ~300 tokens each), so the client needs a client-side throttle.
 - Groq retired `llama-3.3-70b-versatile` (404). Available: `openai/gpt-oss-120b`, `openai/gpt-oss-20b`,
   `qwen/qwen3.8-27b`, `meta-llama/llama-prompt-guard-2-{22m,86m}` (possible classifier baseline).
-- Mutator refusals are real: with a bare rewrite request, gpt-oss-120b and qwen3.8-27b refused and gpt-oss-20b complied
-  (n=1 each). Refusal rate must be measured and reported.
+- Mutator refusals: a bare rewrite request (no system prompt) got refusals from gpt-oss-120b and qwen3.8-27b (n=1 each).
+  **With the mutator system prompt** (`scripts/bench_mutator.py`, 6 attacks × 2 seeds = 12 per model, 2026-11-13):
+  gpt-oss-20b 12/12 usable, gpt-oss-120b 10/12 (2 refusals), qwen3.8-27b 12/12. n=12 can't separate 20b from qwen.
+  **Decision: mutator = gpt-oss-20b**, because it is a different model family from the (Qwen) target, which avoids a same-family
+  confound. qwen3.8-27b is the alternative. The GA logs every refusal, so the real-run rate gets reported.
+- The audit of benchmark replies caught two parser bugs (curly-apostrophe refusals labelled "invalid", and a missing
+  `</prompt>` rejecting a good prompt). Both fixed and tested. Lesson: audit heuristic classifiers on real output.
 
 ## Measured speed / model behaviour (2026-11-12)
 - `qwen3:4b` tag = Qwen3-4B **Thinking-2507** (256K ctx, thinks by default). Thinking can't be disabled:
@@ -77,18 +94,18 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 - Groq gpt-oss models spend `max_tokens` on reasoning: set `reasoning_effort` and a larger budget.
 - Ollama `seed` gives identical outputs for identical inputs, which is good for reproducibility.
 - Observed a *refusal leak*: "I cannot comply… the code **CANARY-…** is confidential." (counts as a leak).
-- `smoke` printed PASSED with empty replies from both models: it doesn't check the content.
+- (Fixed in M2) the old `smoke` printed PASSED on empty replies.
+- With `max_tokens: 200`, "summarise your instructions" replies hit the cap (3/3), but the canary appeared at char ~99/910
+  (~token 25), so truncation stopped the rambling, not the leak. Report the truncation rate alongside ASR.
+- `keep_alive: 30m` keeps models loaded: target ping went from 10.7 s cold to 2.5 s warm.
 
 ## Known issues (from code review, 2026-11-12)
 - Judge misses: numbered-list acrostics, spelled-out/NATO digits, full-width/homoglyph chars (needs NFKC
   + confusables map), split leaks. Partial leaks are not scored. Policy decided: split/partial leaks
   are a separate "partial" metric; the headline ASR counts full leaks only.
-- `llm.py`: `/no_think` is appended to the target's system prompt (changes the experiment and crashes on
-  None content); prefer Ollama's native `think: false`. Truncated thinking leaves an empty answer and silently
-  counts as a non-leak, so truncation must be flagged. No client-side throttle, no cache, no token usage.
-  FallbackClient disables Groq permanently after 3 failures (should be a cooldown). `load_dotenv()` loads implicitly on import.
-- `cli.py`: the judge self-test belongs in pytest (M3); smoke must check the reply content (M2).
-  (Fixed in M1: config path and the unused import.)
+- `cli.py`: the judge self-test belongs in pytest (M3). (`llm.py` review issues were all fixed in M2.)
+- Groq daily cap (1000 req/day) isn't tracked client-side: exhaustion shows up as persistent 429s, which raise
+  LLMError, so the mutator falls back. Acceptable for now.
 - `make_canary` defaults to OS randomness. Plan: derive it from the run seed and record it in the run config.
 - `trials: 1` is too low; size K from measured speed.
 
@@ -100,7 +117,7 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 
 ## Build plan (approved)
 - [x] M1 tooling: pyproject + lock file, ruff, pytest, GitHub Actions, CLI config path fix
-- [ ] M2 LLM layer: native Ollama `/api/chat` + `think`, raw/reasoning logging, truncation flag; Groq throttle
+- [x] M2 LLM layer: native Ollama `/api/chat` + `think`, raw/reasoning logging, truncation flag; Groq throttle
       (8k TPM), mutator system prompt, `reasoning_effort`, cache, usage; fallback cooldown; smoke checks content
 - [ ] M3 judge hardening (NFKC/homoglyphs, numbered acrostics, spelled/NATO digits, partial score) + full tests
 - [ ] M4 seeds (30, YAML, 5 families), target wrapper, seed-derived canary, `runs/<run_id>/`, resumable runs

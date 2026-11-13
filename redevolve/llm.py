@@ -1,154 +1,560 @@
-"""One OpenAI-compatible chat wrapper for Groq (mutator) and Ollama (target)."""
+"""Chat clients for Ollama (target, classifier) and Groq (mutator), over plain httpx.
+
+Design notes:
+- Ollama is called through its *native* ``/api/chat`` endpoint, because only that
+  endpoint honours ``think`` (its OpenAI-compatible endpoint ignores ``/no_think`` and
+  spends the token budget on hidden reasoning; see CLAUDE.md).
+- Groq is called through its OpenAI-compatible REST endpoint, with a client-side
+  rate limiter, so we stay under the free tier's tokens-per-minute cap.
+- Every call returns a :class:`ChatResult` carrying the raw output, any separate
+  reasoning text, token counts and a truncation flag, so callers can log everything.
+- The Groq API key is held privately and never appears in reprs, logs or errors.
+"""
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Protocol
 
-from dotenv import load_dotenv
-from openai import (
-    APIConnectionError,
-    APIStatusError,
-    APITimeoutError,
-    OpenAI,
-    RateLimitError,
-)
+import httpx
+from dotenv import dotenv_values
 
-load_dotenv()
+from .cache import ResponseCache, cache_key
+from .ratelimit import RateLimiter
 
-BASE_URLS = {
-    "groq": "https://api.groq.com/openai/v1",
-    "ollama": os.getenv("OLLAMA_URL", "http://localhost:11434/v1"),
-}
+Message = dict[str, str]
+
+GROQ_URL = "https://api.groq.com/openai/v1"
+OLLAMA_URL = "http://localhost:11434"
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.S)
+_MAX_WAIT_S = 60.0
 
 
 class LLMError(RuntimeError):
-    pass
+    """A chat call failed after retries (or failed in a non-retryable way)."""
 
 
-@dataclass
-class Reply:
+class _Secret:
+    """Holds a credential; masked in ``repr``/``str`` so it can't leak via logs or ``vars()``."""
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: str) -> None:
+        self._value = value
+
+    def reveal(self) -> str:
+        """Return the raw value (only for building the Authorization header)."""
+        return self._value
+
+    def __repr__(self) -> str:
+        return "<secret>"
+
+    __str__ = __repr__
+
+
+@dataclass(frozen=True)
+class ChatResult:
+    """The outcome of one chat call.
+
+    Attributes:
+        text: Visible answer, with any inline ``<think>`` blocks removed. This is what gets judged.
+        raw: The answer exactly as returned by the API.
+        reasoning: Separately returned reasoning/thinking text, if any (not shown to users).
+        provider: ``"ollama"`` or ``"groq"``.
+        model: Model name.
+        latency_s: Wall-clock time of the call (0 for cache hits).
+        prompt_tokens: Prompt tokens, if reported.
+        completion_tokens: Generated tokens, if reported.
+        finish_reason: ``"stop"``, ``"length"`` (hit max_tokens), etc.
+        gen_tok_s: Generation speed, if reported (Ollama only).
+        cached: True if served from the response cache.
+    """
+
     text: str
-    latency: float
+    raw: str
+    reasoning: str | None
+    provider: str
+    model: str
+    latency_s: float
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    finish_reason: str | None = None
+    gen_tok_s: float | None = None
+    cached: bool = False
+
+    @property
+    def truncated(self) -> bool:
+        """True if generation stopped because it hit ``max_tokens``."""
+        return self.finish_reason == "length"
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-serialisable form (includes the derived ``truncated`` flag)."""
+        return {**asdict(self), "truncated": self.truncated}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> ChatResult:
+        """Inverse of :meth:`to_dict` (ignores derived/unknown keys)."""
+        fields = cls.__dataclass_fields__
+        return cls(**{k: v for k, v in d.items() if k in fields})
+
+
+class ChatClient(Protocol):
+    """Anything that can answer a chat request."""
+
     provider: str
     model: str
 
+    def chat(
+        self,
+        messages: list[Message],
+        *,
+        temperature: float,
+        max_tokens: int,
+        seed: int | None = None,
+    ) -> ChatResult: ...
+
 
 def strip_think(text: str) -> str:
-    """Remove qwen3-style reasoning blocks; an unclosed block is dropped entirely."""
+    """Remove ``<think>…</think>`` blocks; an unclosed block is dropped to the end."""
     text = _THINK_RE.sub("", text)
     if "<think>" in text:
         text = text.split("<think>", 1)[0]
     return text.strip()
 
 
-class LLMClient:
-    def __init__(self, provider: str, model: str, max_retries: int = 4, timeout: float = 180):
-        if provider not in BASE_URLS:
-            raise ValueError(f"unknown provider {provider!r}")
-        self.provider = provider
-        self.model = model
-        self.max_retries = max_retries
-        self.timeout = timeout
-        self._client: OpenAI | None = None
+def load_groq_key(env_file: str | Path = ".env") -> str | None:
+    """Read ``GROQ_API_KEY`` from the environment, else from ``env_file``.
 
-    def _get_client(self) -> OpenAI:
-        if self._client is None:
-            if self.provider == "groq":
-                key = os.getenv("GROQ_API_KEY", "").strip()
-                if not key:
-                    raise LLMError("GROQ_API_KEY not set in .env")
-            else:
-                key = "ollama"
-            self._client = OpenAI(
-                base_url=BASE_URLS[self.provider], api_key=key, max_retries=0, timeout=self.timeout
-            )
-        return self._client
+    The value is returned to the caller only; it is never printed or logged here.
+    """
+    key = os.environ.get("GROQ_API_KEY", "").strip()
+    if not key and Path(env_file).is_file():
+        key = (dotenv_values(env_file).get("GROQ_API_KEY") or "").strip()
+    return key or None
+
+
+def _backoff(attempt: int) -> float:
+    return float(min(2**attempt, 30))
+
+
+def _retry_after(r: httpx.Response) -> float | None:
+    value = r.headers.get("retry-after")
+    if value is None:
+        return None
+    try:
+        return min(max(float(value), 0.0), _MAX_WAIT_S)
+    except ValueError:
+        return None
+
+
+def _snippet(r: httpx.Response, n: int = 200) -> str:
+    return r.text[:n].replace("\n", " ")
+
+
+def _post_with_retries(
+    http: httpx.Client,
+    url: str,
+    *,
+    payload: dict[str, Any],
+    headers: dict[str, str] | None,
+    max_retries: int,
+    provider: str,
+    sleep: Callable[[float], None],
+) -> httpx.Response:
+    """POST with retries on connection errors, timeouts, 429 and 5xx; fail fast on other 4xx."""
+    for attempt in range(max_retries + 1):
+        last = attempt == max_retries
+        try:
+            r = http.post(url, json=payload, headers=headers)
+        except httpx.TransportError as e:  # includes timeouts and connection errors
+            if last:
+                raise LLMError(f"{provider} unreachable: {type(e).__name__}: {e}") from e
+            sleep(_backoff(attempt))
+            continue
+        if r.status_code == 429 or r.status_code >= 500:
+            if last:
+                raise LLMError(
+                    f"{provider} HTTP {r.status_code} after {attempt + 1} attempts: {_snippet(r)}"
+                )
+            wait = _retry_after(r)
+            sleep(wait if wait is not None else _backoff(attempt))
+            continue
+        if r.status_code >= 400:
+            raise LLMError(f"{provider} HTTP {r.status_code}: {_snippet(r)}")
+        return r
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _json(r: httpx.Response, provider: str) -> dict[str, Any]:
+    try:
+        return r.json()
+    except (json.JSONDecodeError, ValueError) as e:
+        raise LLMError(f"{provider} returned non-JSON: {_snippet(r)}") from e
+
+
+class OllamaClient:
+    """Client for a local Ollama model via the native ``/api/chat`` endpoint.
+
+    Args:
+        model: Ollama model tag.
+        base_url: Ollama server URL (no ``/v1`` suffix).
+        think: Sent as Ollama's ``think`` flag; None omits it (for models without thinking).
+        keep_alive: How long Ollama keeps the model loaded between calls.
+        timeout_s: Per-request timeout. CPU inference is slow, so this is generous.
+        max_retries: Retries on transient failures.
+        http: Injected httpx client (tests use ``httpx.MockTransport``).
+        sleep: Injected sleep function (tests).
+    """
+
+    provider = "ollama"
+
+    def __init__(
+        self,
+        model: str,
+        *,
+        base_url: str = OLLAMA_URL,
+        think: bool | None = False,
+        keep_alive: str = "30m",
+        timeout_s: float = 300.0,
+        max_retries: int = 2,
+        http: httpx.Client | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.model = model
+        self.base_url = base_url.rstrip("/").removesuffix("/v1")
+        self.think = think
+        self.keep_alive = keep_alive
+        self.max_retries = max_retries
+        self._http = http or httpx.Client(timeout=timeout_s)
+        self._sleep = sleep
+
+    def __repr__(self) -> str:
+        return f"OllamaClient(model={self.model!r}, think={self.think!r})"
 
     def chat(
         self,
-        messages: list[dict],
-        temperature: float = 0.7,
-        max_tokens: int = 256,
+        messages: list[Message],
+        *,
+        temperature: float,
+        max_tokens: int,
         seed: int | None = None,
-    ) -> Reply:
-        client = self._get_client()
-        if self.provider == "ollama" and self.model.startswith("qwen3"):
-            messages = [dict(m) for m in messages]
-            messages[0]["content"] += " /no_think"
-        extra = {"seed": seed} if seed is not None else {}
-        for attempt in range(self.max_retries + 1):
-            t0 = time.perf_counter()
-            try:
-                resp = client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    **extra,
-                )
-                text = strip_think(resp.choices[0].message.content or "")
-                return Reply(text, time.perf_counter() - t0, self.provider, self.model)
-            except RateLimitError as e:
-                if attempt == self.max_retries:
-                    raise LLMError(f"{self.provider} rate-limited: {e}") from e
-                retry_after = e.response.headers.get("retry-after") if e.response else None
-                try:
-                    wait = float(retry_after) if retry_after else 2**attempt
-                except ValueError:
-                    wait = 2**attempt
-                time.sleep(min(wait, 30))
-            except (APIConnectionError, APITimeoutError) as e:
-                if attempt == self.max_retries:
-                    raise LLMError(f"{self.provider} unreachable: {e}") from e
-                time.sleep(2**attempt)
-            except APIStatusError as e:
-                if e.status_code >= 500 and attempt < self.max_retries:
-                    time.sleep(2**attempt)
-                    continue
-                raise LLMError(f"{self.provider} error {e.status_code}: {e}") from e
-        raise LLMError("unreachable")
+    ) -> ChatResult:
+        """Send one non-streamed chat request and return the parsed result."""
+        options: dict[str, Any] = {"temperature": temperature, "num_predict": max_tokens}
+        if seed is not None:
+            options["seed"] = seed
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+            "keep_alive": self.keep_alive,
+            "options": options,
+        }
+        if self.think is not None:
+            payload["think"] = self.think
+        t0 = time.perf_counter()
+        r = _post_with_retries(
+            self._http,
+            f"{self.base_url}/api/chat",
+            payload=payload,
+            headers=None,
+            max_retries=self.max_retries,
+            provider=self.provider,
+            sleep=self._sleep,
+        )
+        latency = time.perf_counter() - t0
+        d = _json(r, self.provider)
+        msg = d.get("message") or {}
+        raw = msg.get("content") or ""
+        eval_count = d.get("eval_count")
+        eval_ns = d.get("eval_duration")
+        return ChatResult(
+            text=strip_think(raw),
+            raw=raw,
+            reasoning=msg.get("thinking") or None,
+            provider=self.provider,
+            model=self.model,
+            latency_s=latency,
+            prompt_tokens=d.get("prompt_eval_count"),
+            completion_tokens=eval_count,
+            finish_reason=d.get("done_reason"),
+            gen_tok_s=(eval_count / (eval_ns / 1e9)) if eval_count and eval_ns else None,
+        )
+
+
+class GroqClient:
+    """Client for Groq's OpenAI-compatible chat endpoint, with client-side rate limiting.
+
+    Args:
+        model: Groq model id (e.g. ``openai/gpt-oss-20b``).
+        api_key: Groq API key. Required; never exposed by this object.
+        base_url: API base URL.
+        reasoning_effort: Passed through for reasoning models (e.g. ``"low"``); None omits it.
+        limiter: Shared :class:`RateLimiter`; None disables client-side limiting.
+        timeout_s: Per-request timeout.
+        max_retries: Retries on transient failures (429/5xx/network).
+        http: Injected httpx client (tests).
+        sleep: Injected sleep function (tests).
+    """
+
+    provider = "groq"
+
+    def __init__(
+        self,
+        model: str,
+        *,
+        api_key: str | None,
+        base_url: str = GROQ_URL,
+        reasoning_effort: str | None = None,
+        limiter: RateLimiter | None = None,
+        timeout_s: float = 60.0,
+        max_retries: int = 3,
+        http: httpx.Client | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        if not api_key:
+            raise LLMError("GROQ_API_KEY is not set (add it to .env)")
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.reasoning_effort = reasoning_effort
+        self.limiter = limiter
+        self.max_retries = max_retries
+        self._api_key = _Secret(api_key)
+        self._http = http or httpx.Client(timeout=timeout_s)
+        self._sleep = sleep
+
+    def __repr__(self) -> str:
+        return f"GroqClient(model={self.model!r}, reasoning_effort={self.reasoning_effort!r})"
+
+    @staticmethod
+    def estimate_tokens(messages: list[Message], max_tokens: int) -> int:
+        """Rough upper estimate of a call's token cost (~4 chars/token plus the output cap)."""
+        chars = sum(len(m.get("content", "")) for m in messages)
+        return chars // 4 + 8 * len(messages) + max_tokens
+
+    def chat(
+        self,
+        messages: list[Message],
+        *,
+        temperature: float,
+        max_tokens: int,
+        seed: int | None = None,
+    ) -> ChatResult:
+        """Send one chat request (waiting on the rate limiter first) and return the result."""
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if seed is not None:
+            payload["seed"] = seed
+        if self.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.reasoning_effort
+        slot = (
+            self.limiter.acquire(self.estimate_tokens(messages, max_tokens))
+            if self.limiter
+            else None
+        )
+        t0 = time.perf_counter()
+        r = _post_with_retries(
+            self._http,
+            f"{self.base_url}/chat/completions",
+            payload=payload,
+            headers={"Authorization": f"Bearer {self._api_key.reveal()}"},
+            max_retries=self.max_retries,
+            provider=self.provider,
+            sleep=self._sleep,
+        )
+        latency = time.perf_counter() - t0
+        d = _json(r, self.provider)
+        try:
+            choice = d["choices"][0]
+            msg = choice["message"]
+        except (KeyError, IndexError, TypeError) as e:
+            raise LLMError(f"groq response missing choices: {_snippet(r)}") from e
+        usage = d.get("usage") or {}
+        if slot is not None:
+            RateLimiter.settle(slot, usage.get("total_tokens"))
+        raw = msg.get("content") or ""
+        return ChatResult(
+            text=strip_think(raw),
+            raw=raw,
+            reasoning=msg.get("reasoning") or None,
+            provider=self.provider,
+            model=self.model,
+            latency_s=latency,
+            prompt_tokens=usage.get("prompt_tokens"),
+            completion_tokens=usage.get("completion_tokens"),
+            finish_reason=choice.get("finish_reason"),
+        )
+
+
+class CachedClient:
+    """Wraps a client with a persistent response cache keyed on the full request.
+
+    Only successful calls are cached. Cache hits are marked ``cached=True`` with
+    ``latency_s=0``.
+    """
+
+    def __init__(self, inner: ChatClient, cache: ResponseCache, *, namespace: str = "") -> None:
+        self.inner = inner
+        self.cache = cache
+        self.namespace = namespace
+        self.provider = inner.provider
+        self.model = inner.model
+
+    def __repr__(self) -> str:
+        return f"CachedClient({self.inner!r})"
+
+    def chat(
+        self,
+        messages: list[Message],
+        *,
+        temperature: float,
+        max_tokens: int,
+        seed: int | None = None,
+    ) -> ChatResult:
+        """Return the cached result for this exact request, or call through and cache it."""
+        key = cache_key(
+            {
+                "ns": self.namespace,
+                "provider": self.inner.provider,
+                "model": self.inner.model,
+                "reasoning_effort": getattr(self.inner, "reasoning_effort", None),
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "seed": seed,
+            }
+        )
+        hit = self.cache.get(key)
+        if hit is not None:
+            return ChatResult.from_dict({**hit, "cached": True, "latency_s": 0.0})
+        result = self.inner.chat(
+            messages, temperature=temperature, max_tokens=max_tokens, seed=seed
+        )
+        self.cache.put(key, result.to_dict())
+        return result
 
 
 class FallbackClient:
-    """Tries the primary client; on failure uses the fallback. After 3 consecutive
-    primary failures the primary is skipped for the rest of the run."""
+    """Tries ``primary``; on :class:`LLMError` answers with ``fallback`` instead.
 
-    def __init__(self, primary: LLMClient, fallback: LLMClient):
+    After ``max_failures`` consecutive primary failures, the primary is skipped for
+    ``cooldown_s`` seconds (not forever), then tried again.
+    """
+
+    def __init__(
+        self,
+        primary: ChatClient,
+        fallback: ChatClient,
+        *,
+        max_failures: int = 3,
+        cooldown_s: float = 300.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.primary = primary
         self.fallback = fallback
-        self._failures = 0
+        self.max_failures = max_failures
+        self.cooldown_s = cooldown_s
+        self._clock = clock
+        self._consecutive_failures = 0
+        self._skip_until = float("-inf")
+        self.provider = primary.provider
+        self.model = primary.model
         self.last_error: str | None = None
+        self.primary_calls = 0
+        self.fallback_calls = 0
 
-    def chat(self, messages, temperature=0.7, max_tokens=256, seed=None) -> Reply:
-        if self._failures < 3:
+    def __repr__(self) -> str:
+        return f"FallbackClient({self.primary!r} -> {self.fallback!r})"
+
+    @property
+    def primary_available(self) -> bool:
+        """False while the primary is in its cooldown period."""
+        return self._clock() >= self._skip_until
+
+    def chat(
+        self,
+        messages: list[Message],
+        *,
+        temperature: float,
+        max_tokens: int,
+        seed: int | None = None,
+    ) -> ChatResult:
+        """Answer with the primary if available and working, else with the fallback."""
+        if self.primary_available:
             try:
-                reply = self.primary.chat(messages, temperature, max_tokens, seed)
-                self._failures = 0
-                return reply
+                result = self.primary.chat(
+                    messages, temperature=temperature, max_tokens=max_tokens, seed=seed
+                )
+                self._consecutive_failures = 0
+                self.primary_calls += 1
+                return result
             except LLMError as e:
-                self._failures += 1
                 self.last_error = str(e)
-        return self.fallback.chat(messages, temperature, max_tokens, seed)
+                self._consecutive_failures += 1
+                if self._consecutive_failures >= self.max_failures:
+                    self._skip_until = self._clock() + self.cooldown_s
+                    self._consecutive_failures = 0
+        self.fallback_calls += 1
+        return self.fallback.chat(
+            messages, temperature=temperature, max_tokens=max_tokens, seed=seed
+        )
 
 
-def build_target(cfg: dict) -> LLMClient:
-    t = cfg["target"]
-    return LLMClient(t["provider"], t["model"])
-
-
-def build_mutator(cfg: dict) -> FallbackClient:
-    m = cfg["mutator"]
-    return FallbackClient(
-        LLMClient(m["provider"], m["model"], max_retries=3),
-        LLMClient(m["fallback_provider"], m["fallback_model"]),
+def _ollama_from(section: dict[str, Any], ollama_cfg: dict[str, Any], model: str) -> OllamaClient:
+    return OllamaClient(
+        model,
+        base_url=os.environ.get("OLLAMA_URL", ollama_cfg.get("base_url", OLLAMA_URL)),
+        think=section.get("think", False),
+        keep_alive=ollama_cfg.get("keep_alive", "30m"),
+        timeout_s=ollama_cfg.get("timeout_s", 300.0),
+        max_retries=ollama_cfg.get("max_retries", 2),
     )
 
 
-def build_classifier(cfg: dict) -> LLMClient:
-    c = cfg["classifier"]
-    return LLMClient(c["provider"], c["model"])
+def build_target(cfg: dict[str, Any]) -> OllamaClient:
+    """Build the target model client from ``cfg["target"]``."""
+    return _ollama_from(cfg["target"], cfg.get("ollama", {}), cfg["target"]["model"])
+
+
+def build_classifier(cfg: dict[str, Any]) -> OllamaClient:
+    """Build the guardrail classifier client from ``cfg["classifier"]``."""
+    return _ollama_from(cfg["classifier"], cfg.get("ollama", {}), cfg["classifier"]["model"])
+
+
+def build_groq(cfg: dict[str, Any], api_key: str | None) -> GroqClient:
+    """Build the bare Groq mutator client (rate-limited, uncached, no fallback)."""
+    m = cfg["mutator"]
+    return GroqClient(
+        m["model"],
+        api_key=api_key,
+        reasoning_effort=m.get("reasoning_effort"),
+        limiter=RateLimiter(m.get("rpm"), m.get("tpm")),
+        timeout_s=m.get("timeout_s", 60.0),
+        max_retries=m.get("max_retries", 3),
+    )
+
+
+def build_mutator(cfg: dict[str, Any], api_key: str | None) -> FallbackClient:
+    """Build the mutator: cached, rate-limited Groq, falling back to a local Ollama model."""
+    m = cfg["mutator"]
+    primary: ChatClient = build_groq(cfg, api_key)
+    if m.get("cache"):
+        primary = CachedClient(primary, ResponseCache(m["cache"]), namespace="mutator")
+    fallback = _ollama_from({"think": False}, cfg.get("ollama", {}), m["fallback_model"])
+    return FallbackClient(
+        primary,
+        fallback,
+        max_failures=m.get("fallback_after_failures", 3),
+        cooldown_s=m.get("fallback_cooldown_s", 300.0),
+    )

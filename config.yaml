@@ -1,23 +1,38 @@
 # RedEvolve configuration. All experiment knobs live here.
 seed: 42
 
+ollama:                  # shared by every local model (target, classifier, mutator fallback)
+  base_url: http://localhost:11434   # env var OLLAMA_URL overrides
+  keep_alive: 30m        # keep models loaded between calls (avoids reload cost on CPU)
+  timeout_s: 300
+  max_retries: 2
+
 target:
   provider: ollama
   model: qwen3:4b-instruct-2507-q4_K_M   # non-thinking; the Thinking-2507 tag took 80-124 s per call
+  think: false
   temperature: 0.7
   max_tokens: 200        # leaks seen by token ~36; acrostics need ~120. Truncation is flagged (see CLAUDE.md)
 
 mutator:
   provider: groq
-  model: openai/gpt-oss-20b   # provisional: llama-3.3-70b-versatile was retired (404); choice pending refusal-rate benchmark
+  model: openai/gpt-oss-20b   # provisional: llama-3.3-70b-versatile was retired (404); see mutator benchmark
+  reasoning_effort: low  # gpt-oss spends max_tokens on reasoning first; keep it short
   temperature: 0.9
-  max_tokens: 400
-  fallback_provider: ollama
-  fallback_model: qwen3:4b-instruct-2507-q4_K_M
+  max_tokens: 800        # covers reasoning + the rewritten prompt
+  rpm: 25                # client-side caps, under the free tier (~30 rpm, 8000 tpm measured)
+  tpm: 7000
+  timeout_s: 60
+  max_retries: 3
+  cache: .cache/mutator.sqlite   # replays identical requests on re-runs; delete to force fresh calls
+  fallback_model: qwen3:4b-instruct-2507-q4_K_M   # local Ollama model used while Groq is failing
+  fallback_after_failures: 3
+  fallback_cooldown_s: 300
 
 classifier:              # guardrail layer (b)
   provider: ollama
   model: qwen3:1.7b
+  think: false
   temperature: 0.0
   max_tokens: 3
 

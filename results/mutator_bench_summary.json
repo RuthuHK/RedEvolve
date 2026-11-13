@@ -1,0 +1,29 @@
+{
+  "openai/gpt-oss-20b": {
+    "n": 12,
+    "ok": 12,
+    "refusal": 0,
+    "invalid": 0,
+    "error": 0,
+    "usable_rate": 1.0,
+    "mean_completion_tokens": 73.83333333333333
+  },
+  "openai/gpt-oss-120b": {
+    "n": 12,
+    "ok": 10,
+    "refusal": 2,
+    "invalid": 0,
+    "error": 0,
+    "usable_rate": 0.8333333333333334,
+    "mean_completion_tokens": 58.166666666666664
+  },
+  "qwen/qwen3.8-27b": {
+    "n": 12,
+    "ok": 12,
+    "refusal": 0,
+    "invalid": 0,
+    "error": 0,
+    "usable_rate": 1.0,
+    "mean_completion_tokens": 61.5
+  }
+}

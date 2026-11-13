@@ -9,7 +9,6 @@ description = "Genetic-algorithm prompt-injection fuzzer for local LLMs, with a 
 requires-python = ">=3.12"
 # Compatible-release ranges for installs; exact versions for reproduction are in requirements-lock.txt.
 dependencies = [
-    "openai~=3.46",
     "httpx~=0.28",
     "python-dotenv~=1.2",
     "pyyaml~=6.0",
