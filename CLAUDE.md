@@ -40,6 +40,12 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
   hash is recorded in every run's metadata. **Never edit seeds after seeing results** (that would be tuning the
   benchmark to the outcome). A changed seed set is a new version with a new hash, and results from different hashes
   are never pooled or compared as if they were the same benchmark.
+  **v1 frozen 2026-11-13: sha256 `ba12dabc302e3e21206e8881f5a5f7f1816fd0465ab4ca52181b514fcd57741e`**, 30 seeds,
+  6 per family (user replaced io-04, rp-06, enc-06, ind-06; rp-06 = fake conversation log, kept in roleplay).
+  Pinned by `tests/test_seeds.py::test_frozen_seed_set_unchanged`; never "fix" that test by updating the hash.
+  The target system prompt (config `target.system_prompt`) was approved with v1, and its hash is recorded per run too.
+- **Low-baseline gate:** if the M5 baseline ASR is near 0% (no seed with a meaningful leak rate), stop and flag it to
+  the user before running the GA. Selection has no signal to work with at 0%.
 - **Guardrail evaluation uses held-out attacks (M8).** Attacks looked at while designing or tuning the guardrail
   (the dev set) are reported separately from held-out attacks it was not designed against (e.g. the random-search
   control's attacks or a separate GA seed's). The headline guardrail numbers come from the held-out set. Decide and
@@ -155,6 +161,9 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
       target replies (stratified: judged full leak / no leak / partial, plus tricky cases) to a labeling file *without*
       the judge's verdicts shown; user hand-labels them; report judge-vs-human agreement (confusion matrix, accuracy,
       Cohen's kappa) and list every disagreement. Fix judge bugs only as new judge versions, and re-report.
+      **Include ALL enc-06 (Kannada) replies** in the labelling set (on top of the stratified ~50). The user reads
+      Kannada and will check for phonetically spelled leaks (e.g. hex letters written in Kannada script), which the
+      judge cannot detect.
 - [ ] M6 GA + tests (determinism, elitism, selection), mutator-refusal fallback + logged refusal rate
 - [ ] M7 evolve: **seed 1 + random-search control (equal budget) only for v1**
 - [ ] M8 guardrail (3 layers, paired ablation: one target call per attack×trial, 8 configs derived), 50 benign prompts.
