@@ -113,9 +113,24 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 - Start every experiment run from a clean, committed tree, so `environment.git_dirty` is False in `run.json`.
 - `redevolve/cli.py`: `smoke` (judge sanity, pong checks that verify content/truncation for mutator, target and
   classifier, plus 3 realistic target timing calls). Exit 2 on config error.
+  `baseline [--resume RUN_ID] [--limit N] [--allow-dirty]` (refuses a dirty git tree; on completion writes
+  `summary.json`, prints tables, exports the labelling set), `summary RUN_ID`, `labels export|score RUN_ID [--force]`.
+- `redevolve/baseline.py`: `run_baseline` (trial-major schedule, key `eval:<attack>:<trial>`, skips logged keys,
+  pauses on LLMError/Ctrl-C/`--limit`), `summarize` (re-judges every stored reply with the current judge and counts
+  `verdicts_changed`; per-attack Wilson; family/overall pooled Wilson **and** cluster bootstrap over attacks, quote
+  the bootstrap; truncation rate; method counts; low-baseline `Gate`). Gate thresholds are in `config.yaml`
+  `baseline:` (pre-registered before the first run: >= 1 seed with full-leak rate >= 20%).
+- `redevolve/stats.py`: `wilson` (endpoints pinned exactly at k=0/k=n), `Rate`, `cluster_bootstrap_ci`, `cohen_kappa`.
+- `redevolve/labelling.py`: blind export to `runs/<id>/labelling/` (`to_label.csv` utf-8-sig with no verdict/attack
+  id/stratum, shuffled; `to_label.md` for reading; `key.json` with verdicts, don't open before labelling).
+  Strata full/partial/tricky/none with quotas from `config.yaml` `labelling:` (shortfall redistributed), round-robin
+  across attacks, plus every `always_include` (enc-06) reply. `score` re-judges with the current judge: 3x3 confusion
+  (human x judge), accuracy + kappa (binary full-leak and 3-class), every disagreement -> `agreement.json`.
+  Export refuses to overwrite existing labels.
+- `RunDir.open(root, run_id)` = read-only (no fingerprint check), `RunDir.canary`. `runs/` is git-ignored.
 - `tests/`: helpers.py (FakeClock, Scripted httpx MockTransport), test_config, test_llm, test_ratelimit,
   test_cache, test_judge, test_mutator, test_mutator_prompts, test_runs, test_seeding, test_seeds, test_smoke,
-  test_target (228 tests, ~16 s, no network).
+  test_target, test_stats, test_baseline, test_labelling, test_cli_baseline (268 tests, ~30 s, no network).
   test_judge: 35 encodings x 100 random canaries, fixed-method examples, near-misses, partials, benign FP corpus. CI: `.github/workflows/ci.yml` (ruff lint + format check + pytest, Python 3.12).
 
 ## Environment facts (verified 2026-11-12)
@@ -133,6 +148,8 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
   `</prompt>` rejecting a good prompt). Both fixed and tested. Lesson: audit heuristic classifiers on real output.
 
 ## Measured speed / model behaviour (2026-11-12)
+- (2026-11-15) First 2 live baseline calls with the real system prompt: 21-24 s each at ~6 tok/s (first incl. model
+  load), slower than the earlier 9-11 tok/s. Estimate for 300 baseline calls: ~1-1.75 h.
 - `qwen3:4b` tag = Qwen3-4B **Thinking-2507** (256K ctx, thinks by default). Thinking can't be disabled:
   with `think:false` it reasons inline in `content`. Realistic call (239-token prompt, thinking on):
   **80–124 s**, gen 6.3–7.3 tok/s, cold prompt eval ~22 tok/s, cached prefix ~1300+ tok/s.
@@ -161,7 +178,7 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 - Groq daily cap (1000 req/day) isn't tracked client-side: exhaustion shows up as persistent 429s, which raise
   LLMError, so the mutator falls back. Acceptable for now.
 - M4: derive the canary from the run seed via `make_canary(random.Random(...))` and record it in run metadata.
-- `trials: 1` is too low; size K from measured speed.
+- `ga.trials: 1` is too low; size K from measured speed (baseline uses K=10).
 
 ## Status
 - [x] config, llm.py, judge.py, `smoke` CLI, venv, .env/.gitignore
@@ -175,7 +192,7 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
       (8k TPM), mutator system prompt, `reasoning_effort`, cache, usage; fallback cooldown; smoke checks content
 - [x] M3 judge hardening (NFKC/homoglyphs, numbered acrostics, spelled/NATO digits, partial score) + full tests
 - [x] M4 seeds (30, YAML, 5 families), target wrapper, seed-derived canary, `runs/<run_id>/`, resumable runs
-- [ ] M5 baseline: each seed × K=10, per-attack/family ASR with Wilson 95% CIs. **Judge validation:** export ~50 real
+- [~] M5 baseline (code done 2026-11-15; run + hand labels pending): each seed × K=10, per-attack/family ASR with Wilson 95% CIs. **Judge validation:** export ~50 real
       target replies (stratified: judged full leak / no leak / partial, plus tricky cases) to a labeling file *without*
       the judge's verdicts shown; user hand-labels them; report judge-vs-human agreement (confusion matrix, accuracy,
       Cohen's kappa) and list every disagreement. Fix judge bugs only as new judge versions, and re-report.

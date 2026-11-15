@@ -169,3 +169,15 @@ def test_refuses_to_write_api_key_anywhere(tmp_path: Path, cfg: dict, seeds) -> 
         run.append({"type": "eval", "reply": f"my key is {key}"})
     with pytest.raises(RunError, match="API key"):
         run.set_status("failed", error=f"401 for {key}")
+
+
+def test_open_is_read_only_and_exposes_canary(tmp_path: Path, cfg: dict, seeds) -> None:
+    run = create(tmp_path, cfg, seeds)
+    run.set_status("complete")
+    before = (run.path / RUN_FILE).read_text(encoding="utf-8")
+    opened = RunDir.open(tmp_path, run.run_id)  # works on complete runs, unlike resume
+    assert opened.canary == derive_canary(cfg["seed"])
+    assert opened.meta["status"] == "complete"
+    assert (run.path / RUN_FILE).read_text(encoding="utf-8") == before
+    with pytest.raises(RunError, match="no run named"):
+        RunDir.open(tmp_path, "missing")

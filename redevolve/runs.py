@@ -191,6 +191,23 @@ class RunDir:
         run._write_meta()
         return run
 
+    @classmethod
+    def open(cls, root: str | Path, run_id: str) -> RunDir:
+        """Open an existing run read-only (for summaries and labelling; no fingerprint check).
+
+        Raises:
+            RunError: If the run doesn't exist.
+        """
+        path = Path(root) / run_id
+        if not (path / RUN_FILE).is_file():
+            raise RunError(f"no run named {run_id!r} in {root}")
+        return cls(path, json.loads((path / RUN_FILE).read_text(encoding="utf-8")))
+
+    @property
+    def canary(self) -> str:
+        """The run's canary (from its fingerprint)."""
+        return self.meta["fingerprint"]["canary"]
+
     # --- metadata -----------------------------------------------------------------
 
     def _write_meta(self) -> None:
