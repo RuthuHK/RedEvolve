@@ -9,7 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from . import baseline, judge, labelling
+from . import baseline, judge, labelling, report
 from .config import ConfigError, load_config
 from .llm import (
     ChatClient,
@@ -304,6 +304,30 @@ def cmd_labels(cfg: dict[str, Any], action: str, run_id: str, *, force: bool) ->
     return 0
 
 
+def cmd_report(cfg: dict[str, Any], *, baseline_run: str | None) -> int:
+    """Regenerate the numbers in README.md from the run logs and result files."""
+    rc = cfg.get("report", {})
+    run_id = baseline_run or rc.get("baseline_run")
+    if not run_id:
+        _err("no baseline run: pass --baseline RUN_ID or set report.baseline_run in config.yaml")
+        return 2
+    run = _open_run(cfg, run_id)
+    if run is None:
+        return 2
+    try:
+        blocks = {
+            "judge-validation": report.judge_validation_section(run),
+            "judge-fp": report.judge_fp_section(Path(rc.get("judge_fp", "results/judge_fp.json"))),
+        }
+        readme = Path(rc.get("readme", "README.md"))
+        report.update_readme(readme, blocks)
+    except report.ReportError as e:
+        _err(str(e))
+        return 2
+    print(f"updated {', '.join(blocks)} in {readme}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point for ``redevolve`` / ``python -m redevolve``; returns a process exit code."""
     p = argparse.ArgumentParser(prog="redevolve")
@@ -320,6 +344,8 @@ def main(argv: list[str] | None = None) -> int:
     lab.add_argument("action", choices=["export", "guide", "score"])
     lab.add_argument("run_id")
     lab.add_argument("--force", action="store_true", help="overwrite an existing export")
+    rep = sub.add_parser("report", help="regenerate the numbers in README.md from the logs")
+    rep.add_argument("--baseline", metavar="RUN_ID", help="default: report.baseline_run")
     args = p.parse_args(argv)
     try:
         cfg = load_config(args.config)
@@ -343,6 +369,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_summary(cfg, args.run_id)
     if args.cmd == "labels":
         return cmd_labels(cfg, args.action, args.run_id, force=args.force)
+    if args.cmd == "report":
+        return cmd_report(cfg, baseline_run=args.baseline)
     return 1
 
 

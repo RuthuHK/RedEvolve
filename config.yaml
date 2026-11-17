@@ -76,3 +76,8 @@ ga:
 defend:
   top_n: 20              # top evolved attacks replayed per guardrail config
   trials: 1
+
+report:                  # `python -m redevolve report` regenerates README numbers from these
+  baseline_run: baseline-20261115-064359-s42
+  judge_fp: results/judge_fp.json
+  readme: README.md

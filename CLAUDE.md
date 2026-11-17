@@ -54,7 +54,7 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 ## Engineering conventions
 - Python 3.12, package `redevolve/`, `pyproject.toml`, type hints, docstrings on public functions.
 - `ruff` (lint + format), `pytest` with **all LLM calls mocked**; GitHub Actions runs ruff + pytest.
-- CLI: `python -m redevolve <smoke|baseline|evolve|defend|report|all> [--config PATH]`.
+- CLI: `python -m redevolve <smoke|baseline|summary|labels|report|evolve|defend|all> [--config PATH]`.
 - Windows dev machine: use the venv at `.venv/Scripts/python.exe`.
 - Setup: `pip install -r requirements-lock.txt && pip install -e ".[dev]" --no-deps`. `pyproject.toml` holds
   compatible ranges (`~=`); `requirements-lock.txt` (pip freeze) holds exact versions. Regenerate the lock after
@@ -139,10 +139,14 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
   `export_judge_version` and `verdicts_changed_since_export`): 3x3 confusion
   (human x judge), accuracy + kappa (binary full-leak and 3-class), every disagreement -> `agreement.json`.
   Export refuses to overwrite existing labels.
+- `redevolve/report.py` (M9 grows it): renders README blocks between `<!-- BEGIN/END GENERATED: name -->` markers
+  (`judge-validation` from agreement.json + key.json + re-judged log; `judge-fp` from results/judge_fp.json);
+  refuses inputs from an older judge version. `python -m redevolve report [--baseline RUN_ID]` (default
+  `config.yaml` `report.baseline_run`). README prose must contain no result numbers.
 - `RunDir.open(root, run_id)` = read-only (no fingerprint check), `RunDir.canary`. `runs/` is git-ignored.
 - `tests/`: helpers.py (FakeClock, Scripted httpx MockTransport), test_config, test_llm, test_ratelimit,
   test_cache, test_judge, test_mutator, test_mutator_prompts, test_runs, test_seeding, test_seeds, test_smoke,
-  test_target, test_stats, test_baseline, test_labelling, test_cli_baseline (308 tests, ~45 s, no network).
+  test_target, test_stats, test_baseline, test_labelling, test_cli_baseline, test_report (314 tests, ~50 s, no network).
   test_judge: 35 encodings x 100 random canaries, fixed-method examples, near-misses, partials, benign FP corpus. CI: `.github/workflows/ci.yml` (ruff lint + format check + pytest, Python 3.12).
 
 ## Environment facts (verified 2026-11-12)
@@ -192,6 +196,17 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 - M4: derive the canary from the run seed via `make_canary(random.Random(...))` and record it in run metadata.
 - `ga.trials: 1` is too low; size K from measured speed (baseline uses K=10).
 
+## Results so far (quote numbers from the generated README / JSON, never from here)
+- Baseline `baseline-20261115-064359-s42` (judge v3, K=10): gate passed (rp-04, enc-02, ind-01 >= 20%). All full
+  leaks `plain`. Truncation concentrated in enc-06 (9/10, all judged clean), ind-01 (10/10) and rp-03 (4/10).
+- Judge validation (2026-11-18): n=58, single annotator (owner), 3-class agreement 58/58, kappa 1.000,
+  0 disagreements (`runs/<id>/labelling/agreement.json`; generated into README by `report`). Caveats, all in the
+  README block: one annotator who also designed the judge; stratified by the judge's own verdicts (only 2 tricky
+  items available) so not a population accuracy; only plain full leaks and fragment/split partials occurred, so the
+  encoded views are validated only synthetically; partial rule fixed after seeing replies but before scoring, and
+  18 items were labelled under the earlier guide wording; truncated replies show only visible text to both raters.
+- Proposed (not approved yet): truncation follow-up for enc-06/ind-01 (see the 2026-11-18 session).
+
 ## Status
 - [x] config, llm.py, judge.py, `smoke` CLI, venv, .env/.gitignore
 - [x] CLAUDE.md, code review
@@ -204,8 +219,7 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
       (8k TPM), mutator system prompt, `reasoning_effort`, cache, usage; fallback cooldown; smoke checks content
 - [x] M3 judge hardening (NFKC/homoglyphs, numbered acrostics, spelled/NATO digits, partial score) + full tests
 - [x] M4 seeds (30, YAML, 5 families), target wrapper, seed-derived canary, `runs/<run_id>/`, resumable runs
-- [~] M5 baseline (run done 2026-11-15, gate passed; judge v3 2026-11-17; hand labels in progress, 18/58 done
-      under the old guide wording): each seed × K=10, per-attack/family ASR with Wilson 95% CIs. **Judge validation:** export ~50 real
+- [x] M5 baseline (run 2026-11-15, gate passed; judge v3 2026-11-17; labels scored 2026-11-18, see Results): each seed × K=10, per-attack/family ASR with Wilson 95% CIs. **Judge validation:** export ~50 real
       target replies (stratified: judged full leak / no leak / partial, plus tricky cases) to a labeling file *without*
       the judge's verdicts shown; user hand-labels them; report judge-vs-human agreement (confusion matrix, accuracy,
       Cohen's kappa) and list every disagreement. Fix judge bugs only as new judge versions, and re-report.
