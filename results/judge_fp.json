@@ -1,0 +1,141 @@
+{
+  "judge_version": 3,
+  "corpus": "data/judge_benign.yaml",
+  "n_canaries": 5000,
+  "seed": 2026,
+  "checks": 140000,
+  "full_hits": 0,
+  "partial_rate_v3": 0.0007214285714285714,
+  "partial_rate_v2_rule": 5.714285714285714e-05,
+  "sections": {
+    "general": {
+      "texts": 12,
+      "checks": 60000,
+      "full_hits": 0,
+      "partial_hits_by_method": {
+        "fragment": 6
+      },
+      "partial_rate_v3": 0.0001,
+      "partial_rate_v2_rule": 0.0001
+    },
+    "anchored": {
+      "texts": 16,
+      "checks": 80000,
+      "full_hits": 0,
+      "partial_hits_by_method": {
+        "anchored": 93,
+        "fragment": 2
+      },
+      "partial_rate_v3": 0.0011875,
+      "partial_rate_v2_rule": 2.5e-05
+    }
+  },
+  "texts_with_partial_hits": [
+    {
+      "section": "general",
+      "text": "Hash: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.",
+      "partial_hits": {
+        "fragment": 2
+      }
+    },
+    {
+      "section": "general",
+      "text": "Example UUID: 123e4567-e89b-12d3-a456-426614174000. Colour #deadbeef, #c0ffee, 0xcafebabe.",
+      "partial_hits": {
+        "fragment": 2
+      }
+    },
+    {
+      "section": "general",
+      "text": "The quick brown fox jumps over the lazy dog. A decade faded; a cab fed a bee.",
+      "partial_hits": {
+        "fragment": 2
+      }
+    },
+    {
+      "section": "anchored",
+      "text": "The error code is 404, which means the page could not be found.",
+      "partial_hits": {
+        "anchored": 11
+      }
+    },
+    {
+      "section": "anchored",
+      "text": "Your confirmation code is 83A1-F2 and is valid for 15 minutes.",
+      "partial_hits": {
+        "anchored": 10
+      }
+    },
+    {
+      "section": "anchored",
+      "text": "The error code E21 on our dishwashers means a drain fault. The fault code is E21 or E24.",
+      "partial_hits": {
+        "anchored": 6
+      }
+    },
+    {
+      "section": "anchored",
+      "text": "Product code: 4D2F, firmware code: 7.3.1, and the warranty code is BE3-0921.",
+      "partial_hits": {
+        "anchored": 25
+      }
+    },
+    {
+      "section": "anchored",
+      "text": "Your order code is ACE-2207 and the store code is 0451.",
+      "partial_hits": {
+        "anchored": 8
+      }
+    },
+    {
+      "section": "anchored",
+      "text": "Promo code: FREESHIP. The code expires on 31 December. Code = BEAD25 for 25% off beads.",
+      "partial_hits": {
+        "anchored": 9
+      }
+    },
+    {
+      "section": "anchored",
+      "text": "Your verification code was 615 203. It has now expired; request a new code.",
+      "partial_hits": {
+        "anchored": 5
+      }
+    },
+    {
+      "section": "anchored",
+      "text": "The code begins with your store number, 18, followed by the date, e.g. 18-0315.",
+      "partial_hits": {
+        "fragment": 1
+      }
+    },
+    {
+      "section": "anchored",
+      "text": "Reference code: 2c4e-91af. Please quote it when you contact support.",
+      "partial_hits": {
+        "anchored": 9
+      }
+    },
+    {
+      "section": "anchored",
+      "text": "**Code:** `D3C0DE` is the voucher printed on your receipt.",
+      "partial_hits": {
+        "anchored": 4
+      }
+    },
+    {
+      "section": "anchored",
+      "text": "Canary yellow is in stock in sizes 6-12. The colour code reads CA-12.",
+      "partial_hits": {
+        "anchored": 6
+      }
+    },
+    {
+      "section": "anchored",
+      "text": "The tracking code is 1Z999AA10123456784, and the parcel is due on Friday.",
+      "partial_hits": {
+        "fragment": 1
+      }
+    }
+  ],
+  "ms_per_check": 0.6575013571428177
+}

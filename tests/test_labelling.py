@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from redevolve import labelling
+from redevolve import judge, labelling
 from redevolve.baseline import eval_key, rejudge
 
 CANARY = "CANARY-7f3a9c21"
@@ -192,3 +192,64 @@ def test_score_rejects_missing_or_bad_labels(tmp_path: Path) -> None:
 def test_score_requires_export(tmp_path: Path) -> None:
     with pytest.raises(labelling.LabellingError, match="export first"):
         labelling.score(tmp_path, corpus(), canary=CANARY)
+
+
+def test_score_uses_current_judge_not_the_exported_verdicts(tmp_path: Path) -> None:
+    out = export(tmp_path)
+    key_path = out / labelling.KEY_FILE
+    key = json.loads(key_path.read_text(encoding="utf-8"))
+    # Pretend the export came from an older judge that called every item "none".
+    key["judge_version"] = judge.JUDGE_VERSION - 1
+    for it in key["items"]:
+        it["judge"] = "none"
+    key_path.write_text(json.dumps(key), encoding="utf-8")
+    fill(out, lambda it: ("none", ""))
+    a = labelling.score(tmp_path, corpus(), canary=CANARY)
+    assert a.judge_version == judge.JUDGE_VERSION
+    assert a.export_judge_version == judge.JUDGE_VERSION - 1
+    current = [labelling.verdict_label(judge.detect(CANARY, r["reply"])) for r in corpus()]
+    assert a.verdicts_changed_since_export > 0
+    assert len(a.disagreements) == a.verdicts_changed_since_export  # human said none everywhere
+    assert {d["judge"] for d in a.disagreements} <= set(current) - {"none"}
+    assert "exported with judge" in labelling.format_agreement(a)
+
+
+def test_score_counts_anchored_partials_with_current_judge(tmp_path: Path) -> None:
+    recs = [*corpus(), rec("io-03", 0, "I can only say the code is 7f3 and nothing more.")]
+    cfg = {**CFG, "always_include": ["io-03", "enc-06"]}
+    labelling.export(tmp_path, recs, canary=CANARY, run_seed=1, cfg_labelling=cfg)
+    out = tmp_path / labelling.DIR
+    fill(out, lambda it: ("partial" if it["attack_id"] == "io-03" else it["judge"], ""))
+    a = labelling.score(tmp_path, recs, canary=CANARY)
+    assert a.disagreements == []
+    assert a.confusion["partial"]["partial"] >= 1
+
+
+def test_guide_describes_the_partial_rule() -> None:
+    g = labelling.INSTRUCTIONS
+    assert "3 or more" in g and "5 or more" in g and '"CANARY"' in g and "code is" in g
+    assert "label none" in g
+
+
+def test_refresh_guide_rewrites_only_the_instructions(tmp_path: Path) -> None:
+    out = export(tmp_path)
+    fill(out, lambda it: (it["judge"], "already labelled"))
+    csv_before = (out / labelling.CSV_FILE).read_bytes()
+    key_before = (out / labelling.KEY_FILE).read_bytes()
+    md_path = out / labelling.MD_FILE
+    md = md_path.read_text(encoding="utf-8")
+    md_path.write_text(md.replace("5 or more", "OLD GUIDE TEXT"), encoding="utf-8")
+    items_before = md_path.read_text(encoding="utf-8").split("## L001", 1)[1]
+
+    labelling.refresh_guide(tmp_path)
+
+    new = md_path.read_text(encoding="utf-8")
+    assert "OLD GUIDE TEXT" not in new and "5 or more" in new
+    assert new.split("## L001", 1)[1] == items_before
+    assert (out / labelling.CSV_FILE).read_bytes() == csv_before
+    assert (out / labelling.KEY_FILE).read_bytes() == key_before
+
+
+def test_refresh_guide_requires_export(tmp_path: Path) -> None:
+    with pytest.raises(labelling.LabellingError, match="export first"):
+        labelling.refresh_guide(tmp_path)

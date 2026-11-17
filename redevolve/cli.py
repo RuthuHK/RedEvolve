@@ -20,7 +20,7 @@ from .llm import (
     build_target,
     load_groq_key,
 )
-from .runs import RunDir, RunError, environment_info
+from .runs import CONFIG_FILE, RunDir, RunError, environment_info
 from .seeding import derive_canary
 from .seeds import SeedError, SeedSet, load_seeds
 from .target import Target
@@ -148,9 +148,12 @@ def write_summary(run: RunDir, cfg: dict[str, Any], seeds: SeedSet) -> baseline.
         gate_min_seeds=b["gate_min_seeds"],
         n_boot=b.get("bootstrap_resamples", 10_000),
     )
-    (run.path / SUMMARY_FILE).write_text(
-        json.dumps(summary.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    path = run.path / SUMMARY_FILE
+    if path.is_file():  # keep the summary from an older judge version instead of overwriting it
+        old = json.loads(path.read_text(encoding="utf-8")).get("judge_version")
+        if old is not None and old != summary.judge_version:
+            path.replace(run.path / f"summary.judge-v{old}.json")
+    path.write_text(json.dumps(summary.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
     return summary
 
 
@@ -268,20 +271,27 @@ def cmd_summary(cfg: dict[str, Any], run_id: str) -> int:
     if seeds.sha256 != run.meta["fingerprint"]["seeds_sha256"]:
         _err("the seed set differs from the one this run used")
         return 2
-    summary = write_summary(run, cfg, seeds)
+    # K, gate thresholds etc. come from the run's own saved config, not the current one.
+    summary = write_summary(run, load_config(run.path / CONFIG_FILE), seeds)
     print(baseline.format_summary(summary))
     _gate_warning(summary)
     return 0
 
 
 def cmd_labels(cfg: dict[str, Any], action: str, run_id: str, *, force: bool) -> int:
-    """Export the blind labelling set for a run, or score the filled-in labels."""
+    """Export the blind labelling set, refresh its guide text, or score the filled-in labels."""
     run = _open_run(cfg, run_id)
     if run is None:
         return 2
     try:
         if action == "export":
             _export_labels(run, cfg, force=force)
+            return 0
+        if action == "guide":
+            path = labelling.refresh_guide(run.path)
+            print(f"instructions in {path} updated (labels in {labelling.CSV_FILE} untouched)")
+            print()
+            print(labelling.INSTRUCTIONS)
             return 0
         agreement = labelling.score(run.path, run.records("eval"), canary=run.canary)
     except labelling.LabellingError as e:
@@ -306,8 +316,8 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--allow-dirty", action="store_true", help="allow uncommitted changes")
     sm = sub.add_parser("summary", help="re-summarise a baseline run from its log")
     sm.add_argument("run_id")
-    lab = sub.add_parser("labels", help="judge validation: export blind labels, or score them")
-    lab.add_argument("action", choices=["export", "score"])
+    lab = sub.add_parser("labels", help="judge validation: export, refresh guide, score")
+    lab.add_argument("action", choices=["export", "guide", "score"])
     lab.add_argument("run_id")
     lab.add_argument("--force", action="store_true", help="overwrite an existing export")
     args = p.parse_args(argv)

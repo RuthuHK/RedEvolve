@@ -112,3 +112,31 @@ def test_labels_score(setup, capsys: pytest.CaptureFixture[str]) -> None:
     agreement = json.loads((d / labelling.AGREEMENT_FILE).read_text(encoding="utf-8"))
     assert agreement["accuracy_full_leak"] == 1.0
     assert json.loads((run.path / RUN_FILE).read_text())["status"] == "complete"
+
+
+def test_summary_archives_older_judge_version_and_uses_run_config(setup) -> None:
+    path, runs, _ = setup
+    assert cli.main(["--config", str(path), "baseline"]) == 0
+    run = only_run(runs)
+    summary_path = run.path / cli.SUMMARY_FILE
+    old = json.loads(summary_path.read_text(encoding="utf-8"))
+    old["judge_version"] = 1
+    summary_path.write_text(json.dumps(old), encoding="utf-8")
+    # A later edit of the current config must not change how this run is summarised.
+    cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
+    cfg["baseline"]["trials"] = 99
+    path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+    assert cli.main(["--config", str(path), "summary", run.run_id]) == 0
+    assert json.loads((run.path / "summary.judge-v1.json").read_text())["judge_version"] == 1
+    new = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert new["trials"] == 1 and new["complete"]
+
+
+def test_labels_guide_command(setup, capsys: pytest.CaptureFixture[str]) -> None:
+    path, runs, _ = setup
+    assert cli.main(["--config", str(path), "baseline"]) == 0
+    run = only_run(runs)
+    capsys.readouterr()
+    assert cli.main(["--config", str(path), "labels", "guide", run.run_id]) == 0
+    assert "untouched" in capsys.readouterr().out
