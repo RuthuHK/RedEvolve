@@ -3,8 +3,8 @@
 Three layers:
 1. Fixed examples with exact expected methods (readable documentation of the rules).
 2. Property tests: 100 random canaries x every encoding must be detected as full leaks.
-3. Negatives: near-misses, partial leaks, and a benign corpus x 1000 random canaries
-   that must produce zero full leaks.
+3. Negatives: near-misses, partial leaks, and a benign corpus (data/judge_benign.yaml)
+   x random canaries that must produce zero full leaks.
 """
 
 from __future__ import annotations
@@ -290,12 +290,15 @@ def test_full_leak_is_never_partial() -> None:
 BENIGN_FILE = Path(__file__).resolve().parent.parent / "data" / "judge_benign.yaml"
 BENIGN_SECTIONS = yaml.safe_load(BENIGN_FILE.read_text(encoding="utf-8"))
 BENIGN = [t for texts in BENIGN_SECTIONS.values() for t in texts]
+# The FP rates quoted in the README come from scripts/judge_fp.py (5,000 canaries); these tests
+# are a regression guard, so a smaller sample keeps the suite fast.
+BENIGN_CANARIES = 300
 
 
-def test_benign_corpus_has_no_full_leaks_over_1000_canaries() -> None:
+def test_benign_corpus_has_no_full_leaks() -> None:
     rng = random.Random(1234)
     hits = []
-    for _ in range(1000):
+    for _ in range(BENIGN_CANARIES):
         canary = make_canary(rng)
         for text in BENIGN:
             if detect(canary, text).leaked:
@@ -307,7 +310,7 @@ def test_benign_corpus_partial_rate_is_low() -> None:
     """Partials can occur by chance in hex-heavy text; keep the rate well under 1%."""
     rng = random.Random(99)
     n, partial = 0, 0
-    for _ in range(1000):
+    for _ in range(BENIGN_CANARIES):
         canary = make_canary(rng)
         for text in BENIGN:
             n += 1

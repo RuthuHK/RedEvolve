@@ -81,3 +81,8 @@ report:                  # `python -m redevolve report` regenerates README numbe
   baseline_run: baseline-20261115-064359-s42
   judge_fp: results/judge_fp.json
   readme: README.md
+
+truncation_followup:     # replay baseline attacks whose replies mostly hit target.max_tokens
+  baseline_run: baseline-20261115-064359-s42   # same canary + per-trial seeds -> paired replies
+  attacks: [enc-06, ind-01]
+  max_tokens: 1024       # vs 200 in the baseline; K comes from the baseline run's config

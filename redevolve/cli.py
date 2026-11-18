@@ -9,7 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from . import baseline, judge, labelling, report
+from . import baseline, judge, labelling, report, truncation
 from .config import ConfigError, load_config
 from .llm import (
     ChatClient,
@@ -23,7 +23,7 @@ from .llm import (
 from .runs import CONFIG_FILE, RunDir, RunError, environment_info
 from .seeding import derive_canary
 from .seeds import SeedError, SeedSet, load_seeds
-from .target import Target
+from .target import Target, system_prompt_hash
 
 PING = [{"role": "user", "content": "Reply with exactly the word: pong"}]
 
@@ -328,6 +328,126 @@ def cmd_report(cfg: dict[str, Any], *, baseline_run: str | None) -> int:
     return 0
 
 
+FOLLOWUP_FILE = "followup.json"
+
+
+def _followup_report(run: RunDir, base: RunDir, fu: dict[str, Any]) -> str:
+    capped = load_config(base.path / CONFIG_FILE)["target"]["max_tokens"]
+    rows = truncation.compare(
+        run.records("eval"),
+        canary=run.canary,
+        attacks=fu["attacks"],
+        capped=capped,
+        uncapped=fu["max_tokens"],
+        trials=run.meta["trials"],
+        baseline_records=base.records("eval"),
+    )
+    data = {
+        "baseline_run": base.run_id,
+        "baseline_max_tokens": capped,
+        "max_tokens": fu["max_tokens"],
+        "judge_version": judge.JUDGE_VERSION,
+        "attacks": [r.to_dict() for r in rows],
+    }
+    (run.path / FOLLOWUP_FILE).write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return truncation.format_comparison(rows, capped=capped, uncapped=fu["max_tokens"])
+
+
+def cmd_truncation(
+    cfg: dict[str, Any],
+    *,
+    resume: str | None,
+    limit: int | None,
+    allow_dirty: bool,
+    config_path: str | None,
+    summarize: str | None,
+) -> int:
+    """Replay chosen baseline attacks with a larger output cap, paired with the baseline."""
+    fu = cfg.get("truncation_followup")
+    if not fu:
+        _err("no truncation_followup section in config.yaml")
+        return 2
+    seeds = _load_seeds(cfg)
+    base = _open_run(cfg, fu["baseline_run"])
+    if seeds is None or base is None:
+        return 2
+    canary = derive_canary(cfg["seed"])
+    bfp = base.meta["fingerprint"]
+    mismatched = [
+        name
+        for name, ok in [
+            ("seed set", bfp["seeds_sha256"] == seeds.sha256),
+            ("canary", bfp["canary"] == canary),
+            ("target model", bfp["target_model"] == cfg["target"]["model"]),
+            (
+                "system prompt",
+                bfp["system_prompt_sha256"] == system_prompt_hash(cfg["target"]["system_prompt"]),
+            ),
+        ]
+        if not ok
+    ]
+    if mismatched:
+        _err(f"can't pair with {base.run_id}: {', '.join(mismatched)} differ from that run")
+        return 2
+    if summarize:
+        run = _open_run(cfg, summarize)
+        if run is None:
+            return 2
+        print(_followup_report(run, base, fu))
+        return 0
+    if not allow_dirty and environment_info().get("git_dirty"):
+        _err("the git tree has uncommitted changes (commit first, or pass --allow-dirty)")
+        return 2
+    base_cfg = load_config(base.path / CONFIG_FILE)
+    trials = base_cfg["baseline"]["trials"]
+    capped = base_cfg["target"]["max_tokens"]
+    try:
+        work = truncation.work_items(
+            seeds, fu["attacks"], trials, capped=capped, uncapped=fu["max_tokens"]
+        )
+    except truncation.FollowupError as e:
+        _err(str(e))
+        return 2
+    root = _runs_root(cfg)
+    extra = {
+        "baseline_run": base.run_id,
+        "attacks": fu["attacks"],
+        "trials": trials,
+        "max_tokens": fu["max_tokens"],
+        "baseline_max_tokens": capped,
+    }
+    try:
+        if resume:
+            run = RunDir.resume(root, resume, cfg, seeds=seeds, canary=canary)
+        else:
+            run = RunDir.create(root, truncation.KIND, cfg, seeds=seeds, canary=canary, extra=extra)
+    except RunError as e:
+        _err(str(e))
+        return 2
+    cfg_flag = f" --config {config_path}" if config_path else ""
+    hint = f"python -m redevolve truncation --resume {run.run_id}{cfg_flag}"
+    print(
+        f"run {run.run_id}: {len(fu['attacks'])} attacks x K={trials} x caps "
+        f"{capped}/{fu['max_tokens']} = {len(work)} evaluations (pairs back to back)"
+    )
+    print(f"  Ctrl-C pauses safely; resume with: {hint}")
+    target = Target.from_config(cfg, canary)
+    try:
+        outcome = baseline.run_evals(run, target, work, run_seed=cfg["seed"], limit=limit)
+    except LLMError as e:
+        _err(f"target failed ({e}); run paused. Fix Ollama, then: {hint}")
+        return 1
+    except KeyboardInterrupt:
+        print(f"\ninterrupted; run paused. Resume with: {hint}", file=sys.stderr)
+        return 130
+    if not outcome.complete:
+        print(f"\npaused ({outcome.total_done}/{outcome.total}). Resume with: {hint}")
+        return 0
+    print("\n" + _followup_report(run, base, fu))
+    print(f"\nwritten to {run.path / FOLLOWUP_FILE}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point for ``redevolve`` / ``python -m redevolve``; returns a process exit code."""
     p = argparse.ArgumentParser(prog="redevolve")
@@ -346,6 +466,11 @@ def main(argv: list[str] | None = None) -> int:
     lab.add_argument("--force", action="store_true", help="overwrite an existing export")
     rep = sub.add_parser("report", help="regenerate the numbers in README.md from the logs")
     rep.add_argument("--baseline", metavar="RUN_ID", help="default: report.baseline_run")
+    tr = sub.add_parser("truncation", help="replay baseline attacks with a larger output cap")
+    tr.add_argument("--resume", metavar="RUN_ID", help="continue a paused follow-up run")
+    tr.add_argument("--limit", type=int, metavar="N", help="pause after N new evaluations")
+    tr.add_argument("--allow-dirty", action="store_true", help="allow uncommitted changes")
+    tr.add_argument("--summarize", metavar="RUN_ID", help="re-print a finished run's comparison")
     args = p.parse_args(argv)
     try:
         cfg = load_config(args.config)
@@ -371,6 +496,18 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_labels(cfg, args.action, args.run_id, force=args.force)
     if args.cmd == "report":
         return cmd_report(cfg, baseline_run=args.baseline)
+    if args.cmd == "truncation":
+        if args.limit is not None and args.limit < 1:
+            _err("--limit must be at least 1")
+            return 2
+        return cmd_truncation(
+            cfg,
+            resume=args.resume,
+            limit=args.limit,
+            allow_dirty=args.allow_dirty,
+            config_path=args.config,
+            summarize=args.summarize,
+        )
     return 1
 
 

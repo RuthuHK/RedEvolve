@@ -54,7 +54,7 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 ## Engineering conventions
 - Python 3.12, package `redevolve/`, `pyproject.toml`, type hints, docstrings on public functions.
 - `ruff` (lint + format), `pytest` with **all LLM calls mocked**; GitHub Actions runs ruff + pytest.
-- CLI: `python -m redevolve <smoke|baseline|summary|labels|report|evolve|defend|all> [--config PATH]`.
+- CLI: `python -m redevolve <smoke|baseline|summary|labels|report|truncation|evolve|defend|all> [--config PATH]`.
 - Windows dev machine: use the venv at `.venv/Scripts/python.exe`.
 - Setup: `pip install -r requirements-lock.txt && pip install -e ".[dev]" --no-deps`. `pyproject.toml` holds
   compatible ranges (`~=`); `requirements-lock.txt` (pip freeze) holds exact versions. Regenerate the lock after
@@ -143,10 +143,19 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
   (`judge-validation` from agreement.json + key.json + re-judged log; `judge-fp` from results/judge_fp.json);
   refuses inputs from an older judge version. `python -m redevolve report [--baseline RUN_ID]` (default
   `config.yaml` `report.baseline_run`). README prose must contain no result numbers.
+- `baseline.WorkItem(trial, attack_id, family, prompt, key, max_tokens=None)` + `run_evals(run, target, items, ...)`:
+  the shared eval loop (baseline and truncation follow-up). `Target.evaluate(..., max_tokens=)` per-call cap override.
+- `redevolve/truncation.py` (`python -m redevolve truncation [--resume|--limit|--allow-dirty|--summarize RUN_ID]`,
+  config `truncation_followup:`): replays chosen attacks at the baseline cap **and** a larger cap, back to back in one
+  session with the same seed (keys `eval:<a>:<t>:cap<N>`), so pairs are exact; `compare` reports capped vs uncapped
+  full-leak rates, transitions, `still_truncated`, `prefix_match` (pairing check) and the baseline's own capped rate as
+  an unpaired reference -> `followup.json`. Refuses a baseline run with a different seed set, canary, target model or
+  system prompt. Separate run kind; the baseline headline stays at the baseline cap.
 - `RunDir.open(root, run_id)` = read-only (no fingerprint check), `RunDir.canary`. `runs/` is git-ignored.
 - `tests/`: helpers.py (FakeClock, Scripted httpx MockTransport), test_config, test_llm, test_ratelimit,
   test_cache, test_judge, test_mutator, test_mutator_prompts, test_runs, test_seeding, test_seeds, test_smoke,
-  test_target, test_stats, test_baseline, test_labelling, test_cli_baseline, test_report (314 tests, ~50 s, no network).
+  test_target, test_stats, test_baseline, test_labelling, test_cli_baseline, test_report, test_truncation (321 tests, ~45 s, no network). Benign-corpus judge tests use
+  300 canaries (regression guard; quoted FP rates come from scripts/judge_fp.py).
   test_judge: 35 encodings x 100 random canaries, fixed-method examples, near-misses, partials, benign FP corpus. CI: `.github/workflows/ci.yml` (ruff lint + format check + pytest, Python 3.12).
 
 ## Environment facts (verified 2026-11-12)
@@ -180,7 +189,10 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 - Ollama OpenAI-compat endpoint **ignores `/no_think`**: thinking goes to `message.reasoning` and eats
   `max_tokens`; the model even reads "/no_think" as user text. Use the native `/api/chat` with `think`.
 - Groq gpt-oss models spend `max_tokens` on reasoning: set `reasoning_effort` and a larger budget.
-- Ollama `seed` gives identical outputs for identical inputs, which is good for reproducibility.
+- Ollama `seed` gives identical outputs for identical inputs **within one session only** (measured 2026-11-18: two
+  back-to-back replays were byte-identical, but neither matched the same call's baseline reply from 3 days earlier;
+  they diverged after ~20 chars). So logs are the record: re-running won't reproduce baseline replies exactly.
+  State this in the README's reproducibility notes. Same-session pairs (e.g. the truncation follow-up) do pair.
 - Observed a *refusal leak*: "I cannot comply… the code **CANARY-…** is confidential." (counts as a leak).
 - (Fixed in M2) the old `smoke` printed PASSED on empty replies.
 - With `max_tokens: 200`, "summarise your instructions" replies hit the cap (3/3), but the canary appeared at char ~99/910
@@ -205,7 +217,8 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
   items available) so not a population accuracy; only plain full leaks and fragment/split partials occurred, so the
   encoded views are validated only synthetically; partial rule fixed after seeing replies but before scoring, and
   18 items were labelled under the earlier guide wording; truncated replies show only visible text to both raters.
-- Proposed (not approved yet): truncation follow-up for enc-06/ind-01 (see the 2026-11-18 session).
+- Truncation follow-up approved 2026-11-18 (enc-06, ind-01; caps 200 vs 1024; K=10 -> 40 calls). Code done; run
+  pending (user runs it). A single dev call: 130 s at cap 1024 (669 tokens), so expect ~1-1.25 h.
 
 ## Status
 - [x] config, llm.py, judge.py, `smoke` CLI, venv, .env/.gitignore

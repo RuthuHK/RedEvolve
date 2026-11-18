@@ -114,9 +114,18 @@ class Target:
         ]
 
     def evaluate(
-        self, attack_id: str, family: str, prompt: str, *, trial: int, seed: int
+        self,
+        attack_id: str,
+        family: str,
+        prompt: str,
+        *,
+        trial: int,
+        seed: int,
+        max_tokens: int | None = None,
     ) -> Evaluation:
         """Send one attack, judge the visible reply, and return both.
+
+        ``max_tokens`` overrides the target's cap for this call only (truncation follow-up).
 
         Raises:
             LLMError: If the target can't be reached; callers checkpoint and stop.
@@ -124,7 +133,7 @@ class Target:
         result = self.client.chat(
             self.messages(prompt),
             temperature=self.temperature,
-            max_tokens=self.max_tokens,
+            max_tokens=self.max_tokens if max_tokens is None else max_tokens,
             seed=seed,
         )
         return Evaluation(

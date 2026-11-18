@@ -34,6 +34,18 @@ def eval_key(attack_id: str, trial: int) -> str:
     return f"eval:{attack_id}:{trial}"
 
 
+@dataclass(frozen=True)
+class WorkItem:
+    """One target evaluation to make: which attack, which trial, its log key and output cap."""
+
+    trial: int
+    attack_id: str
+    family: str
+    prompt: str
+    key: str
+    max_tokens: int | None = None  # None = the target's configured cap
+
+
 def schedule(seeds: SeedSet, trials: int) -> list[tuple[int, str, str, str]]:
     """All (trial, attack_id, family, prompt) work items, trial-major."""
     return [(t, s.id, s.family, s.prompt) for t in range(trials) for s in seeds.seeds]
@@ -87,9 +99,28 @@ def run_baseline(
             with the error first, and everything logged so far is kept.
         KeyboardInterrupt: Re-raised after marking the run ``paused``.
     """
-    work = schedule(seeds, trials)
+    items = [WorkItem(t, a, f, p, eval_key(a, t)) for t, a, f, p in schedule(seeds, trials)]
+    return run_evals(run, target, items, run_seed=run_seed, limit=limit, log=log, clock=clock)
+
+
+def run_evals(
+    run: RunDir,
+    target: Target,
+    work: list[WorkItem],
+    *,
+    run_seed: int,
+    limit: int | None = None,
+    log: Callable[[str], None] = print,
+    clock: Callable[[], float] = time.monotonic,
+) -> RunOutcome:
+    """Evaluate work items in order, skipping keys already in the log.
+
+    Shared by the baseline and the truncation follow-up, so both log identical records with
+    identical target seeds (``target_seed(run_seed, attack_id, trial)``; the cap doesn't enter
+    the seed). Status handling and exceptions are as in :func:`run_baseline`.
+    """
     done = run.completed_keys("eval")
-    todo = [w for w in work if eval_key(w[1], w[0]) not in done]
+    todo = [w for w in work if w.key not in done]
     total, already = len(work), len(work) - len(todo)
     if already:
         log(f"resuming: {already}/{total} evaluations already logged, {len(todo)} to go")
@@ -97,13 +128,24 @@ def run_baseline(
     made, leaks = 0, 0
     started = clock()
     try:
-        for trial, attack_id, family, prompt in todo:
+        for item in todo:
+            trial, attack_id = item.trial, item.attack_id
             if limit is not None and made >= limit:
                 run.set_status("paused", stopped_reason=f"--limit {limit}")
                 return RunOutcome(made, already + made, total, complete=False)
             seed = target_seed(run_seed, attack_id, trial)
-            ev = target.evaluate(attack_id, family, prompt, trial=trial, seed=seed)
-            run.append({**ev.to_record(), "key": eval_key(attack_id, trial)})
+            ev = target.evaluate(
+                attack_id,
+                item.family,
+                item.prompt,
+                trial=trial,
+                seed=seed,
+                max_tokens=item.max_tokens,
+            )
+            record = {**ev.to_record(), "key": item.key}
+            if item.max_tokens is not None:
+                record["max_tokens"] = item.max_tokens
+            run.append(record)
             made += 1
             leaks += ev.verdict.leaked
             avg = (clock() - started) / made
@@ -112,7 +154,8 @@ def run_baseline(
                 remaining = min(remaining, limit - made)
             flag = "LEAK" if ev.verdict.leaked else ("part" if ev.verdict.partial else "-")
             log(
-                f"[{already + made:>4}/{total}] {attack_id:<7} t{trial:<2} {flag:<4} "
+                f"[{already + made:>4}/{total}] {attack_id:<7} t{trial:<2} "
+                f"{'' if item.max_tokens is None else f'cap{item.max_tokens} '}{flag:<4} "
                 f"{ev.result.latency_s:5.1f}s  leaks this session {leaks}/{made}  "
                 f"ETA {_fmt_duration(avg * remaining)}"
             )
