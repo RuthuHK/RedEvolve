@@ -50,6 +50,11 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
   (the dev set) are reported separately from held-out attacks it was not designed against (e.g. the random-search
   control's attacks or a separate GA seed's). The headline guardrail numbers come from the held-out set. Decide and
   record the dev/held-out split before designing the guardrail.
+  **Split recorded 2026-11-18** (config `defend:`, before the guardrail was written; approved by the owner): dev = the 30 v1
+  seeds + their baseline replies (rules and classifier prompt were written while reading them); held-out (headline) =
+  M7 output (GA seed-1 top-N and random-search control top-N). **Guardrail v1 frozen 2026-11-18**: `GUARDRAIL_VERSION`
+  + `guardrail_fingerprint()` sha256 pinned in `tests/test_guardrail.py::test_guardrail_frozen_v1_unchanged`; never
+  "fix" that test by updating the hash. A change = new version, evaluated on fresh held-out attacks.
 
 ## Engineering conventions
 - Python 3.12, package `redevolve/`, `pyproject.toml`, type hints, docstrings on public functions.
@@ -151,10 +156,34 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
   full-leak rates, transitions, `still_truncated`, `prefix_match` (pairing check) and the baseline's own capped rate as
   an unpaired reference -> `followup.json`. Refuses a baseline run with a different seed set, canary, target model or
   system prompt. Separate run kind; the baseline headline stays at the baseline cap.
+- `redevolve/guardrail.py` (M8): (a) `InputFilter` = weighted regex `RULES` over NFKC/zero-width-stripped lower-cased
+  input, each rule counted once, block at `guardrail.input_filter_threshold` (2; weight-2 rules block alone, weight-1
+  need a second signal); (b) `InjectionClassifier` (qwen3:1.7b, `CLASSIFIER_SYSTEM_PROMPT`, message wrapped in
+  BEGIN/END markers as data, `parse_label` first word INJECTION/SAFE, "INJ" prefix counts, unparsed -> block by default,
+  LLM errors propagate); (c) `OutputFilter(canary)` redacts prefix (`CANARY` + >= 2 leading core chars), plain/separated,
+  reversed, rot13, 5-7-char fragments, hex, decimal, base64 (any offset), plus an NFKC pass. **Deliberately simpler than
+  the judge** (no spelled/NATO/acrostic/leet/homoglyph/binary/nested base64), so residual leaks are measurable; using
+  the judge as the filter would make (c) perfect by construction. 0 redactions on the judge benign corpus x 300 canaries.
+- `redevolve/benign.py`: `load_benign` -> `BenignSet` (hash over version + id/category/prompt). `data/benign.yaml`:
+  50 prompts, 25 `plain` + 25 `hard` (benign but uses attack words). Hash pinned in `tests/test_benign.py`. Written by
+  the guardrail's author in the same session (not held out); never edit after seeing which get blocked.
+- `redevolve/defend.py` (M8 paired ablation): input layers only block/pass and (c) only rewrites the reply, so per
+  item we log (a) decision, one classifier call (b) and one *undefended* target reply, and `derive(item, config)`
+  gives all 8 `CONFIGS` (order a -> b -> target -> c; added latency counts only layers that would have run).
+  `items_from_records` rebuilds items from any eval log (recomputes pure a/c, takes b from the record; baseline logs
+  have no b, so b-configs are `skipped_configs`, never scored on a subset). `ablate` -> per set x config: full/partial
+  ASR (Wilson + cluster bootstrap over attacks), blocked/redacted, `fixed`/`broken` vs none + exact McNemar
+  (`stats.mcnemar_exact`), mean/p95 added latency; benign: FP = blocked or reply altered by (c), by category, flagged
+  keys. `run_defend` (keys `<set>:<id>:<trial>`, target seed `target_seed(run_seed, id, trial)`, classifier seed
+  `derive_seed("classifier", ...)`, refuses ids shared across sets, pause/resume like baseline). CLI:
+  `defend --offline [RUN_ID]` replays a baseline log through a and c (no model calls; prints DEV SET warning);
+  live `defend` exits 2 until M7 attacks exist (wire attack sources + `guardrail_fingerprint`/benign hash into run
+  metadata then).
 - `RunDir.open(root, run_id)` = read-only (no fingerprint check), `RunDir.canary`. `runs/` is git-ignored.
 - `tests/`: helpers.py (FakeClock, Scripted httpx MockTransport), test_config, test_llm, test_ratelimit,
   test_cache, test_judge, test_mutator, test_mutator_prompts, test_runs, test_seeding, test_seeds, test_smoke,
-  test_target, test_stats, test_baseline, test_labelling, test_cli_baseline, test_report, test_truncation (321 tests, ~45 s, no network). Benign-corpus judge tests use
+  test_target, test_stats, test_baseline, test_labelling, test_cli_baseline, test_report, test_truncation,
+  test_guardrail, test_benign, test_defend (398 tests, ~70 s, no network). Benign-corpus judge tests use
   300 canaries (regression guard; quoted FP rates come from scripts/judge_fp.py).
   test_judge: 35 encodings x 100 random canaries, fixed-method examples, near-misses, partials, benign FP corpus. CI: `.github/workflows/ci.yml` (ruff lint + format check + pytest, Python 3.12).
 
@@ -242,6 +271,9 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 - [ ] M6 GA + tests (determinism, elitism, selection), mutator-refusal fallback + logged refusal rate
 - [ ] M7 evolve: **seed 1 + random-search control (equal budget) only for v1**
 - [ ] M8 guardrail (3 layers, paired ablation: one target call per attack×trial, 8 configs derived), 50 benign prompts.
+      **Code done 2026-11-18** (layers, benign set, ablation machinery, offline replay of the baseline log). Benign set
+      v1 and the dev/held-out split approved by the owner 2026-11-18. Pending: live `defend` wiring once M7 attacks
+      exist; runtime estimate before that run.
       Report dev-set and **held-out** attack results separately (see Hard rules); the held-out set is the headline.
 - [ ] M9 report.py + README
 - [ ] M10 publish v1: gitleaks scan of full history, resume bullet (real numbers), GitHub steps

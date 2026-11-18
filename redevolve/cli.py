@@ -1,4 +1,4 @@
-"""RedEvolve command line: smoke, baseline, summary, labels (evolve/defend/report to come)."""
+"""RedEvolve command line: smoke, baseline, summary, labels, report, truncation, defend."""
 
 from __future__ import annotations
 
@@ -9,8 +9,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from . import baseline, judge, labelling, report, truncation
+from . import baseline, defend, judge, labelling, report, truncation
+from .benign import BenignError, load_benign
 from .config import ConfigError, load_config
+from .guardrail import InputFilter, OutputFilter, guardrail_fingerprint
 from .llm import (
     ChatClient,
     ChatResult,
@@ -448,6 +450,66 @@ def cmd_truncation(
     return 0
 
 
+def cmd_defend(cfg: dict[str, Any], *, offline: str | None) -> int:
+    """Paired guardrail ablation. Only ``--offline`` exists until M7 produces held-out attacks.
+
+    Offline mode replays a baseline run's logged replies through layers (a) and (c) (pure
+    Python, no model calls). Those are the dev-set attacks, so the numbers are optimistic.
+    Layer (b) needs live classifier calls and is left out.
+    """
+    if offline is None:
+        _err(
+            "the live defend run needs the held-out attacks from M7 (evolve), which don't exist "
+            "yet; use --offline [BASELINE_RUN] to replay the baseline's replies"
+        )
+        return 2
+    run = _open_run(cfg, offline)
+    if run is None:
+        return 2
+    g, d = cfg.get("guardrail", {}), cfg.get("defend", {})
+    try:
+        benign = load_benign(d.get("benign_file", "data/benign.yaml"))
+    except BenignError as e:
+        _err(str(e))
+        return 2
+    in_f = InputFilter(threshold=g.get("input_filter_threshold", 2))
+    out_f = OutputFilter(run.canary, replacement=g.get("output_replacement", "[REDACTED]"))
+    dev_set = (d.get("dev_sets") or ["seeds"])[0]
+    items = defend.items_from_records(
+        run.records("eval"),
+        canary=run.canary,
+        input_filter=in_f,
+        output_filter=out_f,
+        default_set=dev_set,
+    )
+    ab = defend.ablate(
+        items,
+        canary=run.canary,
+        block_message=g.get("block_message", ""),
+        run_seed=cfg["seed"],
+        n_boot=cfg.get("baseline", {}).get("bootstrap_resamples", 10_000),
+    )
+    fp = guardrail_fingerprint(cfg)
+    print(
+        f"OFFLINE replay of {run.run_id} ({len(items)} logged replies), guardrail "
+        f"v{fp['version']} {fp['sha256'][:12]}, judge v{judge.JUDGE_VERSION}"
+    )
+    print(
+        f"DEV SET: the guardrail was designed while reading these {dev_set!r} attacks, so these "
+        "rates are optimistic.\nThe headline numbers come from held-out attacks (M7).\n"
+    )
+    print(defend.format_ablation(ab))
+    decisions = defend.benign_input_filter(benign, in_f)
+    flagged = [(p, x) for p, x in zip(benign.prompts, decisions, strict=True) if x.blocked]
+    print(
+        f"\nbenign prompts blocked by layer (a) alone: {len(flagged)}/{len(benign.prompts)} "
+        "(layers b and c need live calls)"
+    )
+    for p, x in flagged:
+        print(f"  {p.id} [{p.category}] rules {', '.join(x.rules)}: {p.prompt}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point for ``redevolve`` / ``python -m redevolve``; returns a process exit code."""
     p = argparse.ArgumentParser(prog="redevolve")
@@ -471,6 +533,14 @@ def main(argv: list[str] | None = None) -> int:
     tr.add_argument("--limit", type=int, metavar="N", help="pause after N new evaluations")
     tr.add_argument("--allow-dirty", action="store_true", help="allow uncommitted changes")
     tr.add_argument("--summarize", metavar="RUN_ID", help="re-print a finished run's comparison")
+    de = sub.add_parser("defend", help="paired guardrail ablation (8 layer combinations)")
+    de.add_argument(
+        "--offline",
+        nargs="?",
+        const="",
+        metavar="RUN_ID",
+        help="replay a baseline run's replies through layers a and c (default: the report run)",
+    )
     args = p.parse_args(argv)
     try:
         cfg = load_config(args.config)
@@ -508,6 +578,14 @@ def main(argv: list[str] | None = None) -> int:
             config_path=args.config,
             summarize=args.summarize,
         )
+    if args.cmd == "defend":
+        offline = args.offline
+        if offline == "":
+            offline = cfg.get("report", {}).get("baseline_run")
+            if not offline:
+                _err("pass --offline RUN_ID or set report.baseline_run in config.yaml")
+                return 2
+        return cmd_defend(cfg, offline=offline)
     return 1
 
 

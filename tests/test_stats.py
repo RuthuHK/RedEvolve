@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from redevolve.stats import Rate, cluster_bootstrap_ci, cohen_kappa, wilson
+from redevolve.stats import Rate, cluster_bootstrap_ci, cohen_kappa, mcnemar_exact, wilson
 
 
 @pytest.mark.parametrize(
@@ -86,3 +86,13 @@ def test_cohen_kappa() -> None:
         cohen_kappa([], [])
     with pytest.raises(ValueError):
         cohen_kappa(["a"], ["a", "b"])
+
+
+def test_mcnemar_exact() -> None:
+    assert mcnemar_exact(0, 0) == 1.0
+    assert mcnemar_exact(3, 0) == pytest.approx(0.25)  # 2 * (1/2)^3
+    assert mcnemar_exact(0, 10) == pytest.approx(2 / 1024)
+    assert mcnemar_exact(5, 5) == 1.0
+    assert mcnemar_exact(2, 7) == mcnemar_exact(7, 2)
+    with pytest.raises(ValueError):
+        mcnemar_exact(-1, 2)

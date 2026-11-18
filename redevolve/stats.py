@@ -108,3 +108,19 @@ def cohen_kappa(a: Sequence[str], b: Sequence[str]) -> float:
     if pe == 1.0:
         return 1.0 if po == 1.0 else 0.0
     return (po - pe) / (1 - pe)
+
+
+def mcnemar_exact(b: int, c: int) -> float:
+    """Two-sided exact McNemar p-value from the two discordant-pair counts.
+
+    For paired binary outcomes (the same attack x trial with and without a guardrail layer),
+    ``b`` and ``c`` count the pairs that changed in each direction. Under the null, each
+    discordant pair goes either way with probability 1/2. Returns 1.0 when there are none.
+    """
+    if b < 0 or c < 0:
+        raise ValueError(f"counts must be non-negative, got b={b}, c={c}")
+    n = b + c
+    if n == 0:
+        return 1.0
+    tail = sum(math.comb(n, i) for i in range(min(b, c) + 1)) / 2**n
+    return min(1.0, 2 * tail)
