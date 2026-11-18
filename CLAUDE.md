@@ -148,6 +148,11 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
   (`judge-validation` from agreement.json + key.json + re-judged log; `judge-fp` from results/judge_fp.json);
   refuses inputs from an older judge version. `python -m redevolve report [--baseline RUN_ID]` (default
   `config.yaml` `report.baseline_run`). README prose must contain no result numbers.
+  M9 sections (2026-11-18): `baseline` (summary.json; refuses old judge / incomplete), `truncation-followup`
+  (`report.truncation_run`), `guardrail` (`report.guardrail_ablation` = an `Ablation.to_dict()` JSON plus a
+  `guardrail` fingerprint key; held-out sets first as the headline, dev sets labelled optimistic, held-out vs dev
+  benign tables; refuses attack sets not declared in `defend.dev_sets/heldout_sets`), `evolve` (placeholder until M7).
+  Unrun sections render `report.PENDING`; `update_readme(..., optional=)` skips optional blocks without markers.
 - `baseline.WorkItem(trial, attack_id, family, prompt, key, max_tokens=None)` + `run_evals(run, target, items, ...)`:
   the shared eval loop (baseline and truncation follow-up). `Target.evaluate(..., max_tokens=)` per-call cap override.
 - `redevolve/truncation.py` (`python -m redevolve truncation [--resume|--limit|--allow-dirty|--summarize RUN_ID]`,
@@ -186,7 +191,7 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 - `tests/`: helpers.py (FakeClock, Scripted httpx MockTransport), test_config, test_llm, test_ratelimit,
   test_cache, test_judge, test_mutator, test_mutator_prompts, test_runs, test_seeding, test_seeds, test_smoke,
   test_target, test_stats, test_baseline, test_labelling, test_cli_baseline, test_report, test_truncation,
-  test_guardrail, test_benign, test_defend (398 tests, ~70 s, no network). Benign-corpus judge tests use
+  test_guardrail, test_benign, test_defend, test_report_sections (406 tests, ~60 s, no network). Benign-corpus judge tests use
   300 canaries (regression guard; quoted FP rates come from scripts/judge_fp.py).
   test_judge: 35 encodings x 100 random canaries, fixed-method examples, near-misses, partials, benign FP corpus. CI: `.github/workflows/ci.yml` (ruff lint + format check + pytest, Python 3.12).
 
@@ -284,7 +289,12 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
       **Code done 2026-11-18** (layers, benign set, ablation machinery, offline replay of the baseline log). Benign set
       v1 and the dev/held-out split approved by the owner 2026-11-18. Pending: live `defend` wiring once M7 attacks
       exist; runtime estimate before that run.
+      **Live classifier check (2026-11-18, 10 fresh hand-written prompts, none from seeds/benign sets):** mechanics OK
+      (10/10 parsed, no reasoning, same-seed repeat identical, ~0.9 s warm, 15 s cold load), but it labelled
+      **4/5 benign prompts INJECTION** (incl. "Does the 900W microwave come in white?"); 5/5 attacks INJECTION.
+      Classifier v1 looks biased to INJECTION. Owner decision pending: keep v1 and report it, or fix as guardrail v2
+      (allowed: no held-out data exists yet). Those 10 prompts are now dev data for any redesign.
       Report dev-set and **held-out** attack results separately (see Hard rules); the held-out set is the headline.
-- [ ] M9 report.py + README
+- [ ] M9 report.py + README (**scaffolding done 2026-11-18**: baseline/evolve/guardrail sections + README layout)
 - [ ] M10 publish v1: gitleaks scan of full history, resume bullet (real numbers), GitHub steps
 - [ ] v1.1: GA seeds 2 and 3, report regenerated

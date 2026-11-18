@@ -318,6 +318,7 @@ def cmd_report(cfg: dict[str, Any], *, baseline_run: str | None) -> int:
         return 2
     try:
         blocks = {
+            "baseline": report.baseline_section(run),
             "judge-validation": report.judge_validation_section(run),
             "judge-fp": report.judge_fp_section(Path(rc.get("judge_fp", "results/judge_fp.json"))),
         }
@@ -326,8 +327,20 @@ def cmd_report(cfg: dict[str, Any], *, baseline_run: str | None) -> int:
             if trun is None:
                 return 2
             blocks["truncation-followup"] = report.truncation_section(trun)
+        # Sections whose runs don't exist yet render as a placeholder (never as numbers).
+        blocks["evolve"] = report.PENDING  # M7: GA seed 1 vs random-search control
+        d = cfg.get("defend", {})
+        blocks["guardrail"] = (
+            report.guardrail_section(
+                Path(rc["guardrail_ablation"]),
+                dev_sets=list(d.get("dev_sets", [])),
+                heldout_sets=list(d.get("heldout_sets", [])),
+            )
+            if rc.get("guardrail_ablation")
+            else report.PENDING
+        )
         readme = Path(rc.get("readme", "README.md"))
-        report.update_readme(readme, blocks)
+        report.update_readme(readme, blocks, optional={"evolve", "guardrail", "baseline"})
     except report.ReportError as e:
         _err(str(e))
         return 2

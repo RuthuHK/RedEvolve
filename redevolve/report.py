@@ -9,9 +9,10 @@ The README contains marker pairs::
 and :func:`update_readme` replaces what is between them. Text outside the markers is
 hand-written prose and must not contain result numbers.
 
-This module grows in M9 (baseline, GA, control and guardrail sections). It currently renders
-the judge's validation against human labels, its benign false-positive rates and the
-truncation follow-up.
+Sections: ``baseline`` (summary.json), ``judge-validation``, ``judge-fp``,
+``truncation-followup`` (followup.json), ``guardrail`` (an ``Ablation.to_dict()`` JSON, held-out
+sets first) and ``evolve`` (M7; a placeholder until the GA and control runs exist). A section
+whose inputs don't exist yet renders as :data:`PENDING`, never as numbers.
 """
 
 from __future__ import annotations
@@ -211,17 +212,179 @@ def truncation_section(run: RunDir) -> str:
     return "\n".join(lines)
 
 
-def update_readme(readme: Path, blocks: dict[str, str]) -> None:
-    """Replace each generated block in ``readme`` (marker pairs must already exist).
+PENDING = "_Not run yet._"
+
+
+def _ci(lo: float, hi: float) -> str:
+    return f"{_pct(lo)} to {_pct(hi)}"
+
+
+def baseline_section(run: RunDir) -> str:
+    """Markdown for the undefended baseline, from the run's ``summary.json``.
 
     Raises:
-        ReportError: If a marker pair is missing.
+        ReportError: If the summary is missing, incomplete, or from another judge version
+            (re-run ``summary RUN_ID`` first).
+    """
+    s = _read_json(run.path / "summary.json")
+    if s["judge_version"] != judge.JUDGE_VERSION:
+        raise ReportError(
+            f"summary.json is for judge v{s['judge_version']}, current is "
+            f"v{judge.JUDGE_VERSION}: run `summary {run.run_id}` again"
+        )
+    if not s["complete"]:
+        raise ReportError(f"baseline {run.run_id} is incomplete ({s['evaluated']}/{s['expected']})")
+    o = s["overall"]
+    clo, chi = o["full_cluster_ci"]
+    n_attacks = len(s["attacks"])
+    lines = [
+        f"Run `{run.run_id}`: {n_attacks} seed attacks x K={s['trials']} trials = "
+        f"{s['evaluated']} target replies, judge v{s['judge_version']}.",
+        "",
+        f"- **Overall full-leak ASR: {_pct(o['full']['rate'])}** ({o['full']['k']}/"
+        f"{o['full']['n']}; cluster bootstrap 95% CI over attacks {_ci(clo, chi)}; pooled Wilson "
+        f"{_ci(o['full']['ci_low'], o['full']['ci_high'])}, too narrow because trials of one "
+        "attack are correlated).",
+        f"- Partial leaks: {_pct(o['partial']['rate'])}. Replies cut off by the output cap: "
+        f"{_pct(o['truncated']['rate'])}.",
+        "- Full leaks by method: "
+        + (", ".join(f"`{k}` {v}" for k, v in s["full_leak_methods"].items()) or "none")
+        + ".",
+        "",
+        "| family | attacks | full-leak ASR | cluster bootstrap 95% CI | partial | truncated |",
+        "|---|---|---|---|---|---|",
+    ]
+    for f in s["families"]:
+        flo, fhi = f["full_cluster_ci"]
+        lines.append(
+            f"| {f['name']} | {f['n_attacks']} | {_pct(f['full']['rate'])} "
+            f"({f['full']['k']}/{f['full']['n']}) | {_ci(flo, fhi)} | "
+            f"{_pct(f['partial']['rate'])} | {_pct(f['truncated']['rate'])} |"
+        )
+    g = s["gate"]
+    lines += [
+        "",
+        f"Low-baseline gate (fixed before the run: at least {g['min_seeds']} seed with a "
+        f"full-leak rate of at least {_pct(g['min_seed_rate'])}): "
+        f"**{'passed' if g['passed'] else 'failed'}**, qualifying seeds: "
+        f"{', '.join(g['qualifying']) or 'none'}.",
+        "",
+        "<details><summary>Per-attack results</summary>",
+        "",
+        "| attack | family | full leak | Wilson 95% CI | partial | truncated |",
+        "|---|---|---|---|---|---|",
+    ]
+    for a in s["attacks"]:
+        lines.append(
+            f"| {a['name']} | {a['family']} | {a['full']['k']}/{a['full']['n']} | "
+            f"{_ci(a['full']['ci_low'], a['full']['ci_high'])} | {a['partial']['k']}/"
+            f"{a['partial']['n']} | {a['truncated']['k']}/{a['truncated']['n']} |"
+        )
+    lines += ["", "</details>"]
+    return "\n".join(lines)
+
+
+def _ablation_table(rows: list[dict[str, Any]]) -> list[str]:
+    out = [
+        "| layers | full-leak ASR | cluster bootstrap 95% CI | blocked | redacted | "
+        "fixed vs none | McNemar p | added latency (mean / p95) |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for r in rows:
+        ci = r["full_cluster_ci"]
+        out.append(
+            f"| {r['config']} | {_pct(r['full']['rate'])} ({r['full']['k']}/{r['full']['n']}) | "
+            f"{_ci(*ci) if ci else '-'} | {_pct(r['blocked']['rate'])} | "
+            f"{_pct(r['redacted']['rate'])} | {r['fixed_vs_none']} | "
+            f"{r['mcnemar_p_vs_none']:.2g} | {r['mean_added_latency_s'] * 1000:.0f} / "
+            f"{r['p95_added_latency_s'] * 1000:.0f} ms |"
+        )
+    return out
+
+
+def _benign_table(rows: list[dict[str, Any]]) -> list[str]:
+    out = [
+        "| layers | false-positive rate | Wilson 95% CI | blocked | redacted | "
+        "added latency (mean / p95) |",
+        "|---|---|---|---|---|---|",
+    ]
+    for r in rows:
+        fp = r["false_positive"]
+        out.append(
+            f"| {r['config']} | {_pct(fp['rate'])} ({fp['k']}/{fp['n']}) | "
+            f"{_ci(fp['ci_low'], fp['ci_high'])} | {r['blocked']['k']} | {r['redacted']['k']} | "
+            f"{r['mean_added_latency_s'] * 1000:.0f} / {r['p95_added_latency_s'] * 1000:.0f} ms |"
+        )
+    return out
+
+
+def guardrail_section(ablation_path: Path, *, dev_sets: list[str], heldout_sets: list[str]) -> str:
+    """Markdown for the paired guardrail ablation (``Ablation.to_dict()`` JSON).
+
+    Held-out attack sets come first (they are the headline); dev sets follow under an explicit
+    "optimistic" heading. The dev and held-out benign sets get separate tables.
+
+    Raises:
+        ReportError: If the file is missing, from another judge version, or contains an attack
+            set that is neither dev nor held-out (every set must be declared in config).
+    """
+    ab = _read_json(ablation_path)
+    if ab["judge_version"] != judge.JUDGE_VERSION:
+        raise ReportError(
+            f"{ablation_path} is for judge v{ab['judge_version']}, current is "
+            f"v{judge.JUDGE_VERSION}: re-summarise the defend run"
+        )
+    sets = list(dict.fromkeys(r["set"] for r in ab["attacks"]))
+    undeclared = [s for s in sets if s not in dev_sets and s not in heldout_sets]
+    if undeclared:
+        raise ReportError(f"attack sets not declared as dev or held-out in config: {undeclared}")
+    lines: list[str] = []
+    if "guardrail" in ab:
+        g = ab["guardrail"]
+        lines += [f"Guardrail v{g['version']} (`{g['sha256'][:12]}`).", ""]
+    for title, group in (
+        ("Held-out attacks (headline: not seen while designing the guardrail)", heldout_sets),
+        ("Dev attacks (the guardrail was designed while reading these: optimistic)", dev_sets),
+    ):
+        for s in (x for x in sets if x in group):
+            lines += [f"**{title}: `{s}`**", ""]
+            lines += _ablation_table([r for r in ab["attacks"] if r["set"] == s])
+            lines.append("")
+    for s, title in (
+        ("benign_heldout", "Held-out benign prompts (written by the owner, unseen during design)"),
+        ("benign", "Dev benign prompts (written alongside the guardrail)"),
+    ):
+        rows = [r for r in ab["benign"] if r.get("set", "benign") == s]
+        if rows:
+            lines += [f"**{title}**", "", *_benign_table(rows), ""]
+    if ab.get("skipped_configs"):
+        lines.append(
+            f"Not evaluated (no classifier decisions): {', '.join(ab['skipped_configs'])}."
+        )
+    lines.append(
+        "All layer combinations are judged on the same target replies (one call per attack x "
+        "trial), so *fixed vs none* counts paired outcomes and the McNemar test is exact."
+    )
+    return "\n".join(lines).rstrip()
+
+
+def update_readme(
+    readme: Path, blocks: dict[str, str], *, optional: set[str] | frozenset[str] = frozenset()
+) -> None:
+    """Replace each generated block in ``readme`` (marker pairs must already exist).
+
+    Blocks named in ``optional`` are skipped when the README has no marker pair for them.
+
+    Raises:
+        ReportError: If a required marker pair is missing.
     """
     text = readme.read_text(encoding="utf-8")
     for name, body in blocks.items():
         begin, end = BEGIN.format(name=name), END.format(name=name)
         pattern = re.compile(re.escape(begin) + r".*?" + re.escape(end), re.DOTALL)
         if not pattern.search(text):
+            if name in optional:
+                continue
             raise ReportError(f"{readme} has no '{begin}' ... '{end}' marker pair")
         text = pattern.sub(lambda _m, b=begin, e=end, x=body: f"{b}\n{x}\n{e}", text)
     readme.write_text(text, encoding="utf-8")
