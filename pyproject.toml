@@ -7,6 +7,7 @@ name = "redevolve"
 version = "0.1.0"
 description = "Genetic-algorithm prompt-injection fuzzer for local LLMs, with a measured guardrail ablation."
 requires-python = ">=3.12"
+license = { text = "MIT" }
 # Compatible-release ranges for installs; exact versions for reproduction are in requirements-lock.txt.
 dependencies = [
     "httpx~=0.28",

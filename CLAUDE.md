@@ -67,7 +67,7 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
   any dependency change: `pip freeze --exclude-editable > requirements-lock.txt`.
 - Checks before each commit: `ruff check . && ruff format --check . && pytest` (same as CI, `.github/workflows/ci.yml`).
 - Config is read from `./config.yaml` (cwd) or `--config`; `redevolve.config.load_config` raises `ConfigError`.
-- License: not chosen yet (user decision, before publishing).
+- License: MIT (`LICENSE`, owner decision 2026-11-19, before the first public push).
 
 ## Architecture (current files)
 - `redevolve/llm.py` (plain httpx; **no openai SDK**): `ChatResult` (text, raw, reasoning, tokens,
