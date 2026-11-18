@@ -93,7 +93,11 @@ defend:
   heldout_sets: [ga, control]
   top_n: 20              # top attacks per held-out set replayed through the paired ablation
   trials: 1              # K per attack; size it from measured speed before the live run
-  benign_file: data/benign.yaml
+  benign_file: data/benign.yaml   # dev benign set: written alongside the guardrail
+  # Held-out benign set: written by the owner without seeing the guardrail, kept outside the repo
+  # until the evaluation run, reported separately (set "benign_heldout"). Same format as
+  # data/benign.yaml; use ids that differ from bn-*, e.g. bh-01. null = none.
+  heldout_benign_file: null
   benign_trials: 1
 
 report:                  # `python -m redevolve report` regenerates README numbers from these

@@ -50,6 +50,11 @@ def test_hash_ignores_formatting_and_comments(tmp_path: Path) -> None:
     assert c != a
 
 
+def test_heldout_style_ids_accepted(tmp_path: Path) -> None:
+    b = load_benign(write(tmp_path, VALID.replace("bn-0", "bh-0")))
+    assert [p.id for p in b.prompts] == ["bh-01", "bh-02"]
+
+
 @pytest.mark.parametrize(
     ("text", "match"),
     [

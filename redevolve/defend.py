@@ -19,7 +19,9 @@ layers that would actually have run: (b) is skipped when an enabled (a) already 
 (c) when the message was blocked.
 
 Benign prompts go through the same pipeline. A false positive is a benign message that is
-blocked, or whose reply is altered by (c).
+blocked, or whose reply is altered by (c). There are two benign sets, always reported
+separately: the dev set (``data/benign.yaml``, written alongside the guardrail) and an optional
+held-out set the owner wrote without seeing the guardrail (``defend.heldout_benign_file``).
 
 :func:`run_defend` makes the calls (resumable, like the baseline). :func:`items_from_records`
 rebuilds paired items from any eval log (a defend run, or a baseline run offline, in which case
@@ -55,7 +57,11 @@ from .stats import Rate, cluster_bootstrap_ci, mcnemar_exact
 from .target import Target
 
 KIND = "defend"
-BENIGN_SET = "benign"
+BENIGN_SET = "benign"  # dev benign set (data/benign.yaml), written alongside the guardrail
+HELDOUT_BENIGN_SET = (
+    "benign_heldout"  # owner-written, unseen during design (defend.heldout_benign_file)
+)
+BENIGN_SETS = (BENIGN_SET, HELDOUT_BENIGN_SET)
 
 Config = frozenset[str]
 # none, a, b, c, a+b, a+c, b+c, a+b+c
@@ -97,7 +103,7 @@ class PairedItem:
     @property
     def benign(self) -> bool:
         """True for benign prompts (scored for false positives, not leaks)."""
-        return self.set_name == BENIGN_SET
+        return self.set_name in BENIGN_SETS
 
 
 @dataclass(frozen=True)
@@ -237,8 +243,9 @@ class AttackConfigStats:
 
 @dataclass(frozen=True)
 class BenignConfigStats:
-    """The benign set under one configuration."""
+    """One benign set under one configuration."""
 
+    set_name: str
     config: str
     n: int
     false_positive: Rate  # blocked, or reply altered by (c)
@@ -252,6 +259,7 @@ class BenignConfigStats:
     def to_dict(self) -> dict[str, Any]:
         """JSON-friendly form."""
         return {
+            "set": self.set_name,
             "config": self.config,
             "n": self.n,
             "false_positive": self.false_positive.to_dict(),
@@ -311,7 +319,7 @@ def _attack_stats(
 
 
 def _benign_stats(
-    items: list[PairedItem], config: Config, *, canary: str, block_message: str
+    set_name: str, items: list[PairedItem], config: Config, *, canary: str, block_message: str
 ) -> BenignConfigStats:
     outs = [derive(i, config, canary=canary, block_message=block_message) for i in items]
     fp = [o.blocked or o.redacted for o in outs]
@@ -321,6 +329,7 @@ def _benign_stats(
     n = len(items)
     lat = [o.added_latency_s for o in outs]
     return BenignConfigStats(
+        set_name=set_name,
         config=config_name(config),
         n=n,
         false_positive=Rate(sum(fp), n),
@@ -372,8 +381,10 @@ def ablate(
     for s in sets:
         members = [i for i in items if i.set_name == s]
         for c in usable:
-            if s == BENIGN_SET:
-                benign.append(_benign_stats(members, c, canary=canary, block_message=block_message))
+            if s in BENIGN_SETS:
+                benign.append(
+                    _benign_stats(s, members, c, canary=canary, block_message=block_message)
+                )
             else:
                 attacks.append(
                     _attack_stats(
@@ -424,13 +435,13 @@ def format_ablation(ab: Ablation) -> str:
                 f"{_ms(a.p95_added_latency_s)}"
             )
         lines.append("")
-    if ab.benign:
+    for s in dict.fromkeys(b.set_name for b in ab.benign):
         lines += [
-            "benign set",
+            f"benign set {s!r}",
             f"{'config':<7} {'false pos':>9}  {'95% Wilson':<17}  {'blocked':>7}  {'redacted':>8}  "
             f"{'+ms mean':>8}  {'+ms p95':>8}  flagged",
         ]
-        for b in ab.benign:
+        for b in (x for x in ab.benign if x.set_name == s):
             lo, hi = b.false_positive.ci
             lines.append(
                 f"{b.config:<7} {b.false_positive.k:>4}/{b.false_positive.n:<4}  "
@@ -466,10 +477,15 @@ class DefendWork:
         return defend_key(self.set_name, self.item_id, self.trial)
 
 
-def benign_work(benign: BenignSet, trials: int) -> list[DefendWork]:
-    """Every benign prompt x ``trials``, trial-major."""
+def benign_work(benign: BenignSet, trials: int, *, set_name: str = BENIGN_SET) -> list[DefendWork]:
+    """Every benign prompt x ``trials``, trial-major, as set ``set_name``.
+
+    Use :data:`HELDOUT_BENIGN_SET` for the owner's held-out file, so it is reported separately.
+    """
+    if set_name not in BENIGN_SETS:
+        raise ValueError(f"benign set name must be one of {BENIGN_SETS}, got {set_name!r}")
     return [
-        DefendWork(BENIGN_SET, p.id, p.category, p.prompt, t)
+        DefendWork(set_name, p.id, p.category, p.prompt, t)
         for t in range(trials)
         for p in benign.prompts
     ]

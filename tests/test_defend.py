@@ -326,6 +326,41 @@ def test_cli_defend_offline_replays_baseline_log(
     rows = {line.split()[0]: line.split()[1] for line in out.splitlines() if "/" in line[:16]}
     assert rows["none"] == "2/3" and rows["a"] == "1/3"  # rp-02 slips past layer (a)
     assert rows["c"] == "0/3" and "benign prompts blocked by layer (a) alone" in out
+    assert "held-out benign set" not in out  # not configured
+
+    cfg["defend"]["heldout_benign_file"] = str(tmp_path / "does-not-exist.yaml")
+    path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    assert cli.main(["--config", str(path), "defend", "--offline"]) == 0
+    assert "deliberately not loaded offline" in capsys.readouterr().out
     assert cli.main(["--config", str(path), "defend"]) == 2
     assert "held-out attacks from M7" in capsys.readouterr().err
     assert cli.main(["--config", str(path), "defend", "--offline", "nope"]) == 2
+
+
+def test_heldout_benign_set_is_reported_separately() -> None:
+    items = [
+        item("benign:bn-01:0", reply=CLEAN, a=True, set_name="benign", family="plain"),
+        item("benign_heldout:bh-01:0", reply=CLEAN, set_name="benign_heldout", family="mine"),
+        item(
+            "benign_heldout:bh-02:0", reply=CLEAN, b=True, set_name="benign_heldout", family="mine"
+        ),
+    ]
+    ab = ablate(items)
+    rows = {(b.set_name, b.config): b for b in ab.benign}
+    assert ab.attacks == [] and len(ab.benign) == 16
+    assert rows[("benign", "a")].false_positive.k == 1 and rows[("benign", "a")].n == 1
+    assert rows[("benign_heldout", "a")].false_positive.k == 0
+    assert (
+        rows[("benign_heldout", "b")].false_positive.k == 1 and rows[("benign_heldout", "b")].n == 2
+    )
+    text = defend.format_ablation(ab)
+    assert "benign set 'benign'" in text and "benign set 'benign_heldout'" in text
+    assert ab.to_dict()["benign"][0]["set"] == "benign"
+
+
+def test_benign_work_heldout_set_name() -> None:
+    b = load_benign(REPO_BENIGN)
+    work = defend.benign_work(b, 1, set_name=defend.HELDOUT_BENIGN_SET)
+    assert work[0].key == "benign_heldout:bn-01:0"
+    with pytest.raises(ValueError, match="benign set name"):
+        defend.benign_work(b, 1, set_name="dev")

@@ -507,6 +507,10 @@ def cmd_defend(cfg: dict[str, Any], *, offline: str | None) -> int:
     )
     for p, x in flagged:
         print(f"  {p.id} [{p.category}] rules {', '.join(x.rules)}: {p.prompt}")
+    if d.get("heldout_benign_file"):
+        print(
+            "held-out benign set: configured, deliberately not loaded offline (evaluation run only)"
+        )
     return 0
 
 

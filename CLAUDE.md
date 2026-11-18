@@ -167,6 +167,9 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 - `redevolve/benign.py`: `load_benign` -> `BenignSet` (hash over version + id/category/prompt). `data/benign.yaml`:
   50 prompts, 25 `plain` + 25 `hard` (benign but uses attack words). Hash pinned in `tests/test_benign.py`. Written by
   the guardrail's author in the same session (not held out); never edit after seeing which get blocked.
+  **Held-out benign set**: the owner writes ~10 prompts, kept outside the repo until the evaluation run (don't look
+  for them); config `defend.heldout_benign_file` (default null), same format, ids like `bh-01`; set name
+  `benign_heldout`, always reported separately from the dev `benign` set. `defend --offline` never loads it.
 - `redevolve/defend.py` (M8 paired ablation): input layers only block/pass and (c) only rewrites the reply, so per
   item we log (a) decision, one classifier call (b) and one *undefended* target reply, and `derive(item, config)`
   gives all 8 `CONFIGS` (order a -> b -> target -> c; added latency counts only layers that would have run).

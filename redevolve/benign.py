@@ -11,7 +11,7 @@ from pathlib import Path
 
 import yaml
 
-_ID_RE = re.compile(r"^bn-\d{2,3}$")
+_ID_RE = re.compile(r"^[a-z]{2,4}-\d{2,3}$")  # e.g. bn-01 (dev), bh-01 (held-out)
 
 
 class BenignError(ValueError):
