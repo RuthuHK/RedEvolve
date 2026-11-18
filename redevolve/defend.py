@@ -18,6 +18,10 @@ Layers run in the order a -> b -> target -> c. Added latency per configuration c
 layers that would actually have run: (b) is skipped when an enabled (a) already blocked, and
 (c) when the message was blocked.
 
+A comparison classifier (``p``: Llama Prompt Guard 2 86M via Groq) can be logged per item
+too. Its configurations (p, a+p, p+c, a+p+c: ``p`` in place of ``b``) are derived from the same
+target replies and reported separately from the 8 main ones.
+
 Benign prompts go through the same pipeline. A false positive is a benign message that is
 blocked, or whose reply is altered by (c). There are two benign sets, always reported
 separately: the dev set (``data/benign.yaml``, written alongside the guardrail) and an optional
@@ -49,6 +53,7 @@ from .guardrail import (
     InputFilter,
     OutputDecision,
     OutputFilter,
+    PromptGuardClassifier,
 )
 from .llm import LLMError
 from .runs import RunDir
@@ -69,11 +74,23 @@ CONFIGS: tuple[Config, ...] = tuple(
     frozenset(c) for n in range(len(LAYERS) + 1) for c in combinations(LAYERS, n)
 )
 NONE: Config = frozenset()
+# Comparison layer "p": Prompt Guard 2 (86M) in place of the (b) classifier. Its configurations
+# are reported separately from the 8 main ones and never mixed with (b).
+COMPARISON = "p"
+COMPARISON_CONFIGS: tuple[Config, ...] = tuple(
+    frozenset(c) for c in (("p",), ("a", "p"), ("p", "c"), ("a", "p", "c"))
+)
+_ORDER = ("a", "b", "p", "c")
 
 
 def config_name(config: Config) -> str:
-    """``"none"`` or the enabled layers joined in a fixed order, e.g. ``"a+c"``."""
-    return "+".join(x for x in LAYERS if x in config) or "none"
+    """``"none"`` or the enabled layers joined in a fixed order, e.g. ``"a+c"`` or ``"a+p"``."""
+    return "+".join(x for x in _ORDER if x in config) or "none"
+
+
+def is_comparison(name: str) -> bool:
+    """True for a configuration name that uses the comparison classifier (``"p"``)."""
+    return COMPARISON in name.split("+")
 
 
 def defend_key(set_name: str, item_id: str, trial: int) -> str:
@@ -99,6 +116,7 @@ class PairedItem:
     input: InputDecision
     classifier: ClassifierDecision | None  # None when no classifier call was made
     output: OutputDecision
+    comparison: ClassifierDecision | None = None  # Prompt Guard decision, if one was made
 
     @property
     def benign(self) -> bool:
@@ -110,7 +128,7 @@ class PairedItem:
 class Outcome:
     """What the user would have seen for one item under one configuration."""
 
-    blocked_by: str | None  # "a", "b" or None
+    blocked_by: str | None  # "a", "b", "p" or None
     text: str
     redacted: bool
     verdict: judge.Verdict
@@ -124,17 +142,21 @@ class Outcome:
 
 def supports(item: PairedItem, config: Config) -> bool:
     """False if ``config`` needs a layer this item has no decision for."""
-    return "b" not in config or item.classifier is not None
+    return ("b" not in config or item.classifier is not None) and (
+        COMPARISON not in config or item.comparison is not None
+    )
 
 
 def derive(item: PairedItem, config: Config, *, canary: str, block_message: str) -> Outcome:
     """The outcome for ``item`` had only the layers in ``config`` been enabled.
 
     Raises:
-        ValueError: If ``config`` includes (b) but the item has no classifier decision.
+        ValueError: If ``config`` includes (b) or (p) but the item has no such decision.
     """
     if not supports(item, config):
         raise ValueError(f"{item.key}: no classifier decision, can't derive {config_name(config)}")
+    if "b" in config and COMPARISON in config:
+        raise ValueError("(b) and the comparison classifier (p) are never combined")
     latency = 0.0
     blocked_by = None
     if "a" in config:
@@ -146,6 +168,11 @@ def derive(item: PairedItem, config: Config, *, canary: str, block_message: str)
         latency += item.classifier.latency_s
         if item.classifier.blocked:
             blocked_by = "b"
+    if blocked_by is None and COMPARISON in config:
+        assert item.comparison is not None
+        latency += item.comparison.latency_s
+        if item.comparison.blocked:
+            blocked_by = COMPARISON
     if blocked_by is not None:
         text, redacted = block_message, False
     elif "c" in config:
@@ -176,6 +203,7 @@ def items_from_records(
         if rec.get("type") != "eval" or key is None or key in out:
             continue
         cls = rec.get("classifier")
+        cmp_ = rec.get("comparison_classifier")
         out[key] = PairedItem(
             key=key,
             set_name=rec.get("set", default_set),
@@ -188,6 +216,7 @@ def items_from_records(
             input=input_filter.check(rec["prompt"]),
             classifier=ClassifierDecision.from_dict(cls) if cls else None,
             output=output_filter.filter(rec["reply"]),
+            comparison=ClassifierDecision.from_dict(cmp_) if cmp_ else None,
         )
     return list(out.values())
 
@@ -367,13 +396,15 @@ def ablate(
     block_message: str,
     run_seed: int,
     n_boot: int = 10_000,
-    configs: tuple[Config, ...] = CONFIGS,
+    configs: tuple[Config, ...] = CONFIGS + COMPARISON_CONFIGS,
 ) -> Ablation:
     """Derive and score every configuration for every set in ``items``.
 
     A configuration is evaluated only if every item has the decisions it needs (so a set is
     never scored on a subset of its items); otherwise it is listed in ``skipped_configs``.
     """
+    if not any(i.comparison is not None for i in items):  # comparison classifier not run at all
+        configs = tuple(c for c in configs if COMPARISON not in c)
     usable = [c for c in configs if all(supports(i, c) for i in items)]
     skipped = [config_name(c) for c in configs if c not in usable]
     sets = list(dict.fromkeys(i.set_name for i in items))
@@ -452,6 +483,8 @@ def format_ablation(ab: Ablation) -> str:
         lines.append("")
     if ab.skipped_configs:
         lines.append(f"not evaluated (no classifier decisions): {', '.join(ab.skipped_configs)}")
+    if any(is_comparison(r.config) for r in [*ab.attacks, *ab.benign]):
+        lines.append("p = comparison classifier (Prompt Guard 2 86M) in place of b.")
     lines.append(
         "fixed = pairs that leak with no guardrail but not under the config (same replies)."
     )
@@ -499,6 +532,7 @@ def run_defend(
     classifier: InjectionClassifier,
     output_filter: OutputFilter,
     work: list[DefendWork],
+    comparison: PromptGuardClassifier | None = None,
     run_seed: int,
     limit: int | None = None,
     log: Callable[[str], None] = print,
@@ -507,8 +541,11 @@ def run_defend(
     """One classifier call and one (undefended) target call per work item, logged with all
     three layers' decisions. Skips keys already logged; status handling as in the baseline.
 
+    With ``comparison`` (Prompt Guard), each item also gets one comparison-classifier call,
+    logged as ``comparison_classifier``; it never changes which target call is made.
+
     Raises:
-        LLMError: If the target or the classifier fails; the run is marked ``paused`` first.
+        LLMError: If the target or a classifier fails; the run is marked ``paused`` first.
         KeyboardInterrupt: Re-raised after marking the run ``paused``.
     """
     per_id = Counter(i for _, i in {(w.set_name, w.item_id) for w in work})
@@ -531,6 +568,7 @@ def run_defend(
             b = classifier.check(
                 w.prompt, seed=derive_seed("classifier", run_seed, w.item_id, w.trial)
             )
+            pg = comparison.check(w.prompt) if comparison is not None else None
             ev = target.evaluate(
                 w.item_id,
                 w.family,
@@ -547,13 +585,21 @@ def run_defend(
                     "input_filter": a.to_dict(),
                     "classifier": b.to_dict(),
                     "output_filter": c.to_dict(),
+                    **({"comparison_classifier": pg.to_dict()} if pg is not None else {}),
                 }
             )
             made += 1
             avg = (clock() - started) / made
             remaining = len(todo) - made if limit is None else min(len(todo), limit) - made
             flags = "".join(
-                x for x, on in (("a", a.blocked), ("b", b.blocked), ("c", c.redacted)) if on
+                x
+                for x, on in (
+                    ("a", a.blocked),
+                    ("b", b.blocked),
+                    ("p", pg is not None and pg.blocked),
+                    ("c", c.redacted),
+                )
+                if on
             )
             log(
                 f"[{already + made:>4}/{total}] {w.set_name:<8} {w.item_id:<10} t{w.trial:<2} "

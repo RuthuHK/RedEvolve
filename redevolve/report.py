@@ -318,6 +318,13 @@ def _benign_table(rows: list[dict[str, Any]]) -> list[str]:
     return out
 
 
+CMP_TITLE = "Llama Prompt Guard 2 86M (`p`) in place of the classifier (`b`)"
+
+
+def _is_cmp(row: dict[str, Any]) -> bool:
+    return "p" in row["config"].split("+")
+
+
 def guardrail_section(ablation_path: Path, *, dev_sets: list[str], heldout_sets: list[str]) -> str:
     """Markdown for the paired guardrail ablation (``Ablation.to_dict()`` JSON).
 
@@ -347,16 +354,25 @@ def guardrail_section(ablation_path: Path, *, dev_sets: list[str], heldout_sets:
         ("Dev attacks (the guardrail was designed while reading these: optimistic)", dev_sets),
     ):
         for s in (x for x in sets if x in group):
+            rows = [r for r in ab["attacks"] if r["set"] == s]
             lines += [f"**{title}: `{s}`**", ""]
-            lines += _ablation_table([r for r in ab["attacks"] if r["set"] == s])
+            lines += _ablation_table([r for r in rows if not _is_cmp(r)])
             lines.append("")
+            cmp_rows = [r for r in rows if _is_cmp(r) or r["config"] == "none"]
+            if len(cmp_rows) > 1:
+                lines += [f"*Comparison classifier on `{s}`: {CMP_TITLE}*", ""]
+                lines += _ablation_table(cmp_rows)
+                lines.append("")
     for s, title in (
         ("benign_heldout", "Held-out benign prompts (written by the owner, unseen during design)"),
         ("benign", "Dev benign prompts (written alongside the guardrail)"),
     ):
         rows = [r for r in ab["benign"] if r.get("set", "benign") == s]
         if rows:
-            lines += [f"**{title}**", "", *_benign_table(rows), ""]
+            lines += [f"**{title}**", "", *_benign_table([r for r in rows if not _is_cmp(r)]), ""]
+            cmp_rows = [r for r in rows if _is_cmp(r) or r["config"] == "none"]
+            if len(cmp_rows) > 1:
+                lines += [f"*Comparison classifier: {CMP_TITLE}*", "", *_benign_table(cmp_rows), ""]
     if ab.get("skipped_configs"):
         lines.append(
             f"Not evaluated (no classifier decisions): {', '.join(ab['skipped_configs'])}."

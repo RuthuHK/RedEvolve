@@ -10,7 +10,7 @@ import yaml
 
 from redevolve import cli, defend, judge, report
 from redevolve.config import load_config
-from redevolve.guardrail import guardrail_fingerprint
+from redevolve.guardrail import ClassifierDecision, guardrail_fingerprint
 from tests.test_cli_baseline import setup  # noqa: F401  (fixture)
 from tests.test_config import REPO_CONFIG
 from tests.test_defend import CLEAN, item
@@ -61,7 +61,8 @@ def test_guardrail_section_puts_heldout_first_and_separates_benign(tmp_path: Pat
     dev = text.index("Dev attacks")
     assert held < dev and "`ga`" in text[held:dev] and "`seeds`" in text[dev:]
     assert text.index("Held-out benign") < text.index("Dev benign")
-    assert "Guardrail v1" in text and "| a+b+c |" in text
+    assert "Guardrail v2" in text and "| a+b+c |" in text
+    assert "Comparison classifier" not in text  # no p decisions in this ablation
     # every attack set must be declared, so nothing is silently reported as the headline
     with pytest.raises(report.ReportError, match="not declared"):
         report.guardrail_section(p, dev_sets=["seeds"], heldout_sets=[])
@@ -106,3 +107,22 @@ def test_report_renders_placeholders_and_guardrail(setup, tmp_path: Path) -> Non
     assert cli.main(["--config", str(path), "report"]) == 0
     text = readme.read_text(encoding="utf-8")
     assert text.count(report.PENDING) == 1 and "Held-out attacks (headline" in text
+
+
+def test_guardrail_section_reports_comparison_separately(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    pg = ClassifierDecision("injection", True, "0.9", 0.2, "groq/pg", 0.9)
+    items = [
+        replace(item("ga:g1:0", set_name="ga"), comparison=pg),
+        replace(item("benign:bn-01:0", reply=CLEAN, set_name="benign"), comparison=pg),
+    ]
+    ab = defend.ablate(items, canary=item().reply.split()[-1].rstrip("."), block_message="no",
+                       run_seed=1, n_boot=100).to_dict()  # fmt: skip
+    p = tmp_path / "ablation.json"
+    p.write_text(json.dumps(ab), encoding="utf-8")
+    text = report.guardrail_section(p, dev_sets=[], heldout_sets=["ga"])
+    main, _, cmp_part = text.partition("*Comparison classifier on `ga`")
+    assert "| a+b+c |" in main and "| a+p+c |" not in main
+    assert "| a+p+c |" in cmp_part and "| none |" in cmp_part
+    assert "*Comparison classifier: Llama Prompt Guard" in text

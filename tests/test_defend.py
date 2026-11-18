@@ -205,7 +205,7 @@ class StubClassifier:
         self.calls: list[tuple[str, int | None]] = []
 
     def chat(self, messages, *, temperature, max_tokens, seed=None) -> ChatResult:
-        msg = messages[1]["content"]
+        msg = messages[-1]["content"]
         self.calls.append((msg, seed))
         word = "INJECTION" if "ignore" in msg.lower() else "SAFE"
         return ChatResult(word, word, None, "ollama", "stub-clf", 0.5)
@@ -364,3 +364,90 @@ def test_benign_work_heldout_set_name() -> None:
     assert work[0].key == "benign_heldout:bn-01:0"
     with pytest.raises(ValueError, match="benign set name"):
         defend.benign_work(b, 1, set_name="dev")
+
+
+# --- comparison classifier (p) ----------------------------------------------------------
+
+
+def with_pg(it: PairedItem, blocked: bool, lat: float = 0.2) -> PairedItem:
+    from dataclasses import replace
+
+    d = ClassifierDecision("injection" if blocked else "safe", blocked, "0.9", lat, "groq/pg", 0.9)
+    return replace(it, comparison=d)
+
+
+def test_comparison_configs_are_separate_and_never_mix_b_and_p() -> None:
+    names = [config_name(c) for c in defend.COMPARISON_CONFIGS]
+    assert names == ["p", "a+p", "p+c", "a+p+c"]
+    assert not any("b" in c for c in defend.COMPARISON_CONFIGS)
+    assert defend.is_comparison("a+p+c") and not defend.is_comparison("a+b+c")
+    with pytest.raises(ValueError, match="never combined"):
+        derive(with_pg(item(), True), frozenset({"b", "p"}), canary=CANARY, block_message=BLOCK)
+
+
+def test_derive_with_comparison_classifier() -> None:
+    it = with_pg(item(b=False), True)
+    o = derive(it, cfg_named_any("a+p+c"), canary=CANARY, block_message=BLOCK)
+    assert o.blocked_by == "p" and o.added_latency_s == pytest.approx(0.001 + 0.2)
+    o = derive(with_pg(item(), False), cfg_named_any("p+c"), canary=CANARY, block_message=BLOCK)
+    assert not o.blocked and o.redacted
+    with pytest.raises(ValueError, match="classifier"):
+        derive(item(), cfg_named_any("p"), canary=CANARY, block_message=BLOCK)
+
+
+def cfg_named_any(name: str) -> frozenset[str]:
+    (c,) = [c for c in CONFIGS + defend.COMPARISON_CONFIGS if config_name(c) == name]
+    return c
+
+
+def test_ablation_includes_comparison_only_when_logged() -> None:
+    plain = ablate([item("dev:x:0"), item("dev:y:0", b=True)])
+    assert [r.config for r in plain.attacks] == [config_name(c) for c in CONFIGS]
+    assert plain.skipped_configs == []
+
+    both = ablate([with_pg(item("dev:x:0"), True), with_pg(item("dev:y:0", b=True), False)])
+    rows = {r.config: r for r in both.attacks}
+    assert len(both.attacks) == 12 and both.skipped_configs == []
+    assert rows["p"].full.k == 1 and rows["p"].blocked_by == {"p": 1}
+    assert rows["b"].full.k == 1 and rows["b"].blocked_by == {"b": 1}
+    assert "p = comparison classifier" in defend.format_ablation(both)
+
+    partial = ablate([with_pg(item("dev:x:0"), True), item("dev:y:0")])
+    assert partial.skipped_configs == ["p", "a+p", "p+c", "a+p+c"]
+
+
+class StubPromptGuard:
+    provider, model = "groq", "stub-pg"
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def chat(self, messages, *, temperature, max_tokens, seed=None) -> ChatResult:
+        msg = messages[-1]["content"]
+        self.calls.append(msg)
+        score = "0.99" if "previous instructions" in msg else "0.01"
+        return ChatResult(score, score, None, "groq", "stub-pg", 0.1)
+
+
+def test_run_defend_logs_comparison_classifier(tmp_path: Path) -> None:
+    from redevolve.guardrail import PromptGuardClassifier
+
+    tc = StubTarget()
+    run, target, _, kw = setup_run(tmp_path, tc)
+    pg_client = StubPromptGuard()
+    out = defend.run_defend(
+        run, target, work=WORK, comparison=PromptGuardClassifier(pg_client), **kw
+    )
+    assert out.complete and len(pg_client.calls) == 4 and len(tc.calls) == 4
+    recs = list(run.records("eval"))
+    assert recs[0]["comparison_classifier"]["blocked"] and recs[0]["comparison_classifier"]["score"]
+    items = defend.items_from_records(
+        run.records(),
+        canary=CANARY,
+        input_filter=InputFilter(),
+        output_filter=OutputFilter(CANARY),
+        default_set="?",
+    )
+    ab = ablate(items)
+    rows = {(r.set_name, r.config): r for r in ab.attacks}
+    assert rows[("ga", "p")].full.k == 1 and rows[("ga", "none")].full.k == 2

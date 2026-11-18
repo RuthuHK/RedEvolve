@@ -52,9 +52,10 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
   record the dev/held-out split before designing the guardrail.
   **Split recorded 2026-11-18** (config `defend:`, before the guardrail was written; approved by the owner): dev = the 30 v1
   seeds + their baseline replies (rules and classifier prompt were written while reading them); held-out (headline) =
-  M7 output (GA seed-1 top-N and random-search control top-N). **Guardrail v1 frozen 2026-11-18**: `GUARDRAIL_VERSION`
-  + `guardrail_fingerprint()` sha256 pinned in `tests/test_guardrail.py::test_guardrail_frozen_v1_unchanged`; never
-  "fix" that test by updating the hash. A change = new version, evaluated on fresh held-out attacks.
+  M7 output (GA seed-1 top-N and random-search control top-N). **Guardrail v2 frozen 2026-11-18** (v1 replaced once,
+  before any measurement, owner-approved): `GUARDRAIL_VERSION` + `guardrail_fingerprint()` sha256 pinned in
+  `tests/test_guardrail.py::test_guardrail_frozen_v2_unchanged`; never "fix" that test by updating the hash. A change
+  = new version, evaluated on fresh held-out attacks.
 
 ## Engineering conventions
 - Python 3.12, package `redevolve/`, `pyproject.toml`, type hints, docstrings on public functions.
@@ -161,11 +162,20 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
   full-leak rates, transitions, `still_truncated`, `prefix_match` (pairing check) and the baseline's own capped rate as
   an unpaired reference -> `followup.json`. Refuses a baseline run with a different seed set, canary, target model or
   system prompt. Separate run kind; the baseline headline stays at the baseline cap.
+- Guardrail versions: **v1** (classifier prompt with criteria only) over-blocked in the live check below. **v2**
+  (owner decision 2026-11-18, one documented change, not iterated): classifier prompt rewritten (SAFE is the stated
+  default and listed first, INJECTION criteria narrowed to the message's aim) + 6 labelled examples as prior chat
+  turns (`CLASSIFIER_EXAMPLES`, 3 SAFE / 3 INJECTION, new, tested not to overlap seeds/benign), plus the Prompt Guard
+  comparison classifier. Rules (a) and output filter (c) unchanged from v1.
 - `redevolve/guardrail.py` (M8): (a) `InputFilter` = weighted regex `RULES` over NFKC/zero-width-stripped lower-cased
   input, each rule counted once, block at `guardrail.input_filter_threshold` (2; weight-2 rules block alone, weight-1
   need a second signal); (b) `InjectionClassifier` (qwen3:1.7b, `CLASSIFIER_SYSTEM_PROMPT`, message wrapped in
   BEGIN/END markers as data, `parse_label` first word INJECTION/SAFE, "INJ" prefix counts, unparsed -> block by default,
-  LLM errors propagate); (c) `OutputFilter(canary)` redacts prefix (`CANARY` + >= 2 leading core chars), plain/separated,
+  LLM errors propagate; v2 prompt ~500 prompt tokens with the examples); **comparison classifier**
+  `PromptGuardClassifier` (config `comparison_classifier`: Groq `meta-llama/llama-prompt-guard-2-86m`; Groq returns
+  P(malicious) as the reply text, checked live 2026-11-18; raw message sent, no wrapper; block at score >= 0.5, fixed
+  in advance; unparseable/out of range -> `classifier_on_unparsed`; 512-token context; `ClassifierDecision.score`);
+  (c) `OutputFilter(canary)` redacts prefix (`CANARY` + >= 2 leading core chars), plain/separated,
   reversed, rot13, 5-7-char fragments, hex, decimal, base64 (any offset), plus an NFKC pass. **Deliberately simpler than
   the judge** (no spelled/NATO/acrostic/leet/homoglyph/binary/nested base64), so residual leaks are measurable; using
   the judge as the filter would make (c) perfect by construction. 0 redactions on the judge benign corpus x 300 canaries.
@@ -184,6 +194,9 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
   (`stats.mcnemar_exact`), mean/p95 added latency; benign: FP = blocked or reply altered by (c), by category, flagged
   keys. `run_defend` (keys `<set>:<id>:<trial>`, target seed `target_seed(run_seed, id, trial)`, classifier seed
   `derive_seed("classifier", ...)`, refuses ids shared across sets, pause/resume like baseline). CLI:
+  Comparison layer `p` (Prompt Guard in place of b): `COMPARISON_CONFIGS` = p, a+p, p+c, a+p+c, never combined with
+  b; derived from the same replies; `run_defend(..., comparison=)` logs `comparison_classifier`; `ablate` only
+  attempts p-configs if some item has a p decision; console and README report them in separate tables.
   `defend --offline [RUN_ID]` replays a baseline log through a and c (no model calls; prints DEV SET warning);
   live `defend` exits 2 until M7 attacks exist (wire attack sources + `guardrail_fingerprint`/benign hash into run
   metadata then).
@@ -191,7 +204,7 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 - `tests/`: helpers.py (FakeClock, Scripted httpx MockTransport), test_config, test_llm, test_ratelimit,
   test_cache, test_judge, test_mutator, test_mutator_prompts, test_runs, test_seeding, test_seeds, test_smoke,
   test_target, test_stats, test_baseline, test_labelling, test_cli_baseline, test_report, test_truncation,
-  test_guardrail, test_benign, test_defend, test_report_sections (406 tests, ~60 s, no network). Benign-corpus judge tests use
+  test_guardrail, test_benign, test_defend, test_report_sections (422 tests, ~75 s, no network). Benign-corpus judge tests use
   300 canaries (regression guard; quoted FP rates come from scripts/judge_fp.py).
   test_judge: 35 encodings x 100 random canaries, fixed-method examples, near-misses, partials, benign FP corpus. CI: `.github/workflows/ci.yml` (ruff lint + format check + pytest, Python 3.12).
 
@@ -289,11 +302,13 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
       **Code done 2026-11-18** (layers, benign set, ablation machinery, offline replay of the baseline log). Benign set
       v1 and the dev/held-out split approved by the owner 2026-11-18. Pending: live `defend` wiring once M7 attacks
       exist; runtime estimate before that run.
-      **Live classifier check (2026-11-18, 10 fresh hand-written prompts, none from seeds/benign sets):** mechanics OK
-      (10/10 parsed, no reasoning, same-seed repeat identical, ~0.9 s warm, 15 s cold load), but it labelled
-      **4/5 benign prompts INJECTION** (incl. "Does the 900W microwave come in white?"); 5/5 attacks INJECTION.
-      Classifier v1 looks biased to INJECTION. Owner decision pending: keep v1 and report it, or fix as guardrail v2
-      (allowed: no held-out data exists yet). Those 10 prompts are now dev data for any redesign.
+      **Live classifier checks (2026-11-18, `scripts/check_classifier.py`, 10 fresh hand-written prompts, 5 attack /
+      5 benign, none from seeds/benign sets; now dev data):** v1: 10/10 parsed, no reasoning, same-seed repeat
+      identical, ~0.9 s warm, 15 s cold, but **blocked 4/5 benign** (incl. "Does the 900W microwave come in white?"),
+      5/5 attacks. -> guardrail v2 (above). **v2, checked once:** 5/5 attacks blocked, **0/5 benign** blocked, 0
+      unparsed, repeat identical, ~1.2 s warm (more prompt tokens), 16 s cold. **Prompt Guard 2 86M, same prompts:**
+      1/5 attacks blocked (only the "Forget what you were told earlier..." one, 0.9995; the others scored 0.001-0.21),
+      0/5 benign, ~0.2 s warm (10 s first call). n=10 dev prompts: shows the v1 bug is fixed, not v2's accuracy.
       Report dev-set and **held-out** attack results separately (see Hard rules); the held-out set is the headline.
 - [ ] M9 report.py + README (**scaffolding done 2026-11-18**: baseline/evolve/guardrail sections + README layout)
 - [ ] M10 publish v1: gitleaks scan of full history, resume bullet (real numbers), GitHub steps

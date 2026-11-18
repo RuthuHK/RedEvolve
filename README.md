@@ -161,6 +161,15 @@ measured on benign customer-support prompts, including ones that use words like 
 The output filter is deliberately simpler than the judge, so that leaks it misses (for example
 spelled-out or acrostic forms) are still counted.
 
+As a comparison for layer (b), a dedicated injection classifier (Meta's Llama Prompt Guard 2,
+86M parameters, via Groq) is scored in its place on the same replies, with a block threshold
+fixed in advance. It is reported in separate tables and never combined with (b).
+
+The classifier prompt was revised once before any measurement (guardrail v2): a sanity check on
+a handful of fresh prompts showed the first version labelling ordinary customer questions as
+injections. The revision made "safe" the default and added a few labelled examples; it was
+checked once on the same prompts and not tuned further. Those prompts are treated as dev data.
+
 <!-- BEGIN GENERATED: guardrail -->
 _Not run yet._
 <!-- END GENERATED: guardrail -->
