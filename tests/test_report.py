@@ -10,6 +10,8 @@ import pytest
 import yaml
 
 from redevolve import cli, judge, labelling, report
+from redevolve.runs import RunDir
+from redevolve.stats import Rate
 from tests.test_cli_baseline import only_run, setup  # noqa: F401  (fixture)
 
 README = """# T
@@ -127,3 +129,38 @@ def test_report_command_end_to_end(setup, tmp_path: Path) -> None:  # noqa: F811
     text = readme.read_text(encoding="utf-8")
     assert "Cohen's kappa" in text and "full-leak hits" in text
     assert cli.main(["--config", str(path), "report", "--baseline", "nope"]) == 2
+
+
+def _rate(k: int, n: int) -> dict:
+    return Rate(k, n).to_dict()
+
+
+def test_truncation_section(tmp_path: Path) -> None:
+    d = tmp_path / "truncation-x"
+    d.mkdir()
+    (d / "run.json").write_text(json.dumps({"run_id": "truncation-x"}), encoding="utf-8")
+    fu = {
+        "baseline_max_tokens": 200,
+        "max_tokens": 1024,
+        "judge_version": judge.JUDGE_VERSION,
+        "attacks": [
+            {
+                "attack_id": "enc-06",
+                "pairs": 10,
+                "capped_full": _rate(3, 10),
+                "uncapped_full": _rate(5, 10),
+                "transitions": {"full->full": 3, "none->full": 2, "none->none": 5},
+                "still_truncated": 1,
+                "prefix_match": 7,
+                "baseline_capped_full": _rate(0, 10),
+            }
+        ],
+    }
+    (d / "followup.json").write_text(json.dumps(fu), encoding="utf-8")
+    text = report.truncation_section(RunDir.open(tmp_path, "truncation-x"))
+    assert "| enc-06 | 0/10 (0.0% to 27.8%) | 3/10 (10.8% to 60.3%) | 5/10" in text
+    assert "none->full 2" in text and "| 1/10 | 7/10 |" in text
+    fu["judge_version"] -= 1
+    (d / "followup.json").write_text(json.dumps(fu), encoding="utf-8")
+    with pytest.raises(report.ReportError, match="--summarize truncation-x"):
+        report.truncation_section(RunDir.open(tmp_path, "truncation-x"))

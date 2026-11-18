@@ -102,6 +102,7 @@ defend:
 
 report:                  # `python -m redevolve report` regenerates README numbers from these
   baseline_run: baseline-20261115-064359-s42
+  truncation_run: truncation-20261118-115338-s42   # optional
   judge_fp: results/judge_fp.json
   readme: README.md
 

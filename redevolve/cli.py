@@ -321,6 +321,11 @@ def cmd_report(cfg: dict[str, Any], *, baseline_run: str | None) -> int:
             "judge-validation": report.judge_validation_section(run),
             "judge-fp": report.judge_fp_section(Path(rc.get("judge_fp", "results/judge_fp.json"))),
         }
+        if rc.get("truncation_run"):
+            trun = _open_run(cfg, rc["truncation_run"])
+            if trun is None:
+                return 2
+            blocks["truncation-followup"] = report.truncation_section(trun)
         readme = Path(rc.get("readme", "README.md"))
         report.update_readme(readme, blocks)
     except report.ReportError as e:

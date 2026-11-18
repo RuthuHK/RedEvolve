@@ -249,8 +249,15 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
   items available) so not a population accuracy; only plain full leaks and fragment/split partials occurred, so the
   encoded views are validated only synthetically; partial rule fixed after seeing replies but before scoring, and
   18 items were labelled under the earlier guide wording; truncated replies show only visible text to both raters.
-- Truncation follow-up approved 2026-11-18 (enc-06, ind-01; caps 200 vs 1024; K=10 -> 40 calls). Code done; run
-  pending (user runs it). A single dev call: 130 s at cap 1024 (669 tokens), so expect ~1-1.25 h.
+- Truncation follow-up `truncation-20261118-115338-s42` (2026-11-18, one session, ~34 min; enc-06 + ind-01, caps
+  200 vs 1024, K=10): the 200 cap **undercounts leaks for long-output attacks** (both attacks leak more at 1024), and
+  there is **cross-session variance at the same cap** (enc-06 baseline @200 vs follow-up @200 differ, CIs overlap).
+  Numbers: README block `truncation-followup` (from `followup.json`, config `report.truncation_run`). Both points are
+  in the README Limitations. **Decision (owner, 2026-11-18): keep `max_tokens: 200` for M7** for comparability with
+  the baseline; the README notes the resulting GA bias (fitness under-rewards late leaks).
+  Observation, unexplained: 3/10 pairs per attack were not exact (the @1024 reply diverged from its @200 partner
+  after 20-417 chars, same session and seed), all at trials 0, 4 and 8 for both attacks. Don't assume same-session
+  replays pair exactly; the M8 ablation doesn't depend on it (one target call per item).
 
 ## Status
 - [x] config, llm.py, judge.py, `smoke` CLI, venv, .env/.gitignore

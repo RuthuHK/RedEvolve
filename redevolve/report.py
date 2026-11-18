@@ -10,7 +10,8 @@ and :func:`update_readme` replaces what is between them. Text outside the marker
 hand-written prose and must not contain result numbers.
 
 This module grows in M9 (baseline, GA, control and guardrail sections). It currently renders
-the judge's validation against human labels and its benign false-positive rates.
+the judge's validation against human labels, its benign false-positive rates and the
+truncation follow-up.
 """
 
 from __future__ import annotations
@@ -160,6 +161,52 @@ def judge_fp_section(fp_path: Path) -> str:
         "",
         "`anchored` texts are customer-support replies that put a code-like token right after "
         '"code is" / "code:", the worst case for the anchored-partial rule.',
+    ]
+    return "\n".join(lines)
+
+
+def _rate(d: dict[str, Any]) -> str:
+    return f"{d['k']}/{d['n']} ({_pct(d['ci_low'])} to {_pct(d['ci_high'])})"
+
+
+def truncation_section(run: RunDir) -> str:
+    """Markdown for the truncation follow-up (``followup.json`` in a ``truncation`` run).
+
+    Raises:
+        ReportError: If ``followup.json`` is missing or from another judge version.
+    """
+    fu = _read_json(run.path / "followup.json")
+    if fu["judge_version"] != judge.JUDGE_VERSION:
+        raise ReportError(
+            f"followup.json is for judge v{fu['judge_version']}, current is "
+            f"v{judge.JUDGE_VERSION}: run `truncation --summarize {run.run_id}` again"
+        )
+    cap, big = fu["baseline_max_tokens"], fu["max_tokens"]
+    lines = [
+        f"Attacks whose baseline replies mostly hit the output cap, replayed in run "
+        f"`{run.run_id}` at **both** caps ({cap} and {big} tokens), back to back with the same "
+        "seed. Full-leak rates with Wilson 95% CIs:",
+        "",
+        f"| attack | baseline @{cap} (earlier session) | follow-up @{cap} | follow-up @{big} | "
+        f"transitions @{cap} -> @{big} | still truncated @{big} | exact pairs |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for a in fu["attacks"]:
+        base = a["baseline_capped_full"]
+        trans = ", ".join(f"{k} {v}" for k, v in a["transitions"].items())
+        lines.append(
+            f"| {a['attack_id']} | {_rate(base) if base else '-'} | {_rate(a['capped_full'])} | "
+            f"{_rate(a['uncapped_full'])} | {trans} | {a['still_truncated']}/{a['pairs']} | "
+            f"{a['prefix_match']}/{a['pairs']} |"
+        )
+    lines += [
+        "",
+        f"- *Exact pairs* = the @{big} reply starts with its @{cap} partner, i.e. generation was "
+        "identical up to the cap. Pairs that diverge show that even same-session, same-seed "
+        "replies are not always reproducible.",
+        f"- *Baseline @{cap}* comes from a different session than the follow-up, so it is an "
+        "unpaired reference: the difference between the two columns at the same cap is "
+        "cross-session variance, not an effect of the cap.",
     ]
     return "\n".join(lines)
 
