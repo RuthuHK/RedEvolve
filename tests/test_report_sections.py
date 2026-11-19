@@ -76,7 +76,7 @@ def test_guardrail_section_puts_heldout_first_and_separates_benign(tmp_path: Pat
 def test_update_readme_optional_blocks(tmp_path: Path) -> None:
     p = tmp_path / "README.md"
     p.write_text("<!-- BEGIN GENERATED: a -->\n<!-- END GENERATED: a -->\n", encoding="utf-8")
-    report.update_readme(p, {"a": "x", "b": "y"}, optional={"b"})
+    assert report.update_readme(p, {"a": "x", "b": "y"}, optional={"b"}) == ["a"]
     assert "x" in p.read_text(encoding="utf-8")
     with pytest.raises(report.ReportError):
         report.update_readme(p, {"b": "y"})

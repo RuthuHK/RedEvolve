@@ -11,7 +11,7 @@ hand-written prose and must not contain result numbers.
 
 Sections: ``baseline`` (summary.json), ``judge-validation``, ``judge-fp``,
 ``truncation-followup`` (followup.json), ``guardrail`` (an ``Ablation.to_dict()`` JSON, held-out
-sets first) and ``evolve`` (M7; a placeholder until the GA and control runs exist). A section
+sets first) and ``evolve`` (v1.1; a placeholder, skipped if the README has no markers). A section
 whose inputs don't exist yet renders as :data:`PENDING`, never as numbers.
 """
 
@@ -386,15 +386,19 @@ def guardrail_section(ablation_path: Path, *, dev_sets: list[str], heldout_sets:
 
 def update_readme(
     readme: Path, blocks: dict[str, str], *, optional: set[str] | frozenset[str] = frozenset()
-) -> None:
+) -> list[str]:
     """Replace each generated block in ``readme`` (marker pairs must already exist).
 
     Blocks named in ``optional`` are skipped when the README has no marker pair for them.
+
+    Returns:
+        The names of the blocks that were written, in order.
 
     Raises:
         ReportError: If a required marker pair is missing.
     """
     text = readme.read_text(encoding="utf-8")
+    written: list[str] = []
     for name, body in blocks.items():
         begin, end = BEGIN.format(name=name), END.format(name=name)
         pattern = re.compile(re.escape(begin) + r".*?" + re.escape(end), re.DOTALL)
@@ -403,4 +407,6 @@ def update_readme(
                 continue
             raise ReportError(f"{readme} has no '{begin}' ... '{end}' marker pair")
         text = pattern.sub(lambda _m, b=begin, e=end, x=body: f"{b}\n{x}\n{e}", text)
+        written.append(name)
     readme.write_text(text, encoding="utf-8")
+    return written

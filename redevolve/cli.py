@@ -328,7 +328,7 @@ def cmd_report(cfg: dict[str, Any], *, baseline_run: str | None) -> int:
                 return 2
             blocks["truncation-followup"] = report.truncation_section(trun)
         # Sections whose runs don't exist yet render as a placeholder (never as numbers).
-        blocks["evolve"] = report.PENDING  # M7: GA seed 1 vs random-search control
+        blocks["evolve"] = report.PENDING  # v1.1 GA; skipped while README has no markers
         d = cfg.get("defend", {})
         blocks["guardrail"] = (
             report.guardrail_section(
@@ -340,11 +340,11 @@ def cmd_report(cfg: dict[str, Any], *, baseline_run: str | None) -> int:
             else report.PENDING
         )
         readme = Path(rc.get("readme", "README.md"))
-        report.update_readme(readme, blocks, optional={"evolve", "guardrail", "baseline"})
+        written = report.update_readme(readme, blocks, optional={"evolve", "guardrail", "baseline"})
     except report.ReportError as e:
         _err(str(e))
         return 2
-    print(f"updated {', '.join(blocks)} in {readme}")
+    print(f"updated {', '.join(written)} in {readme}")
     return 0
 
 
@@ -469,7 +469,7 @@ def cmd_truncation(
 
 
 def cmd_defend(cfg: dict[str, Any], *, offline: str | None) -> int:
-    """Paired guardrail ablation. Only ``--offline`` exists until M7 produces held-out attacks.
+    """Paired guardrail ablation. Only ``--offline`` exists until the held-out set is frozen.
 
     Offline mode replays a baseline run's logged replies through layers (a) and (c) (pure
     Python, no model calls). Those are the dev-set attacks, so the numbers are optimistic.
@@ -477,8 +477,8 @@ def cmd_defend(cfg: dict[str, Any], *, offline: str | None) -> int:
     """
     if offline is None:
         _err(
-            "the live defend run needs the held-out attacks from M7 (evolve), which don't exist "
-            "yet; use --offline [BASELINE_RUN] to replay the baseline's replies"
+            "the live defend run needs the held-out attack set (public datasets), which isn't "
+            "frozen yet; use --offline [BASELINE_RUN] to replay the baseline's replies"
         )
         return 2
     run = _open_run(cfg, offline)
@@ -514,7 +514,7 @@ def cmd_defend(cfg: dict[str, Any], *, offline: str | None) -> int:
     )
     print(
         f"DEV SET: the guardrail was designed while reading these {dev_set!r} attacks, so these "
-        "rates are optimistic.\nThe headline numbers come from held-out attacks (M7).\n"
+        "rates are optimistic.\nThe headline numbers come from held-out attacks.\n"
     )
     print(defend.format_ablation(ab))
     decisions = defend.benign_input_filter(benign, in_f)

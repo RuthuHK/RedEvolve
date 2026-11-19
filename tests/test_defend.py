@@ -333,7 +333,7 @@ def test_cli_defend_offline_replays_baseline_log(
     assert cli.main(["--config", str(path), "defend", "--offline"]) == 0
     assert "deliberately not loaded offline" in capsys.readouterr().out
     assert cli.main(["--config", str(path), "defend"]) == 2
-    assert "held-out attacks from M7" in capsys.readouterr().err
+    assert "held-out attack set" in capsys.readouterr().err
     assert cli.main(["--config", str(path), "defend", "--offline", "nope"]) == 2
 
 

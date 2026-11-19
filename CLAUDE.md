@@ -52,7 +52,11 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
   record the dev/held-out split before designing the guardrail.
   **Split recorded 2026-11-18** (config `defend:`, before the guardrail was written; approved by the owner): dev = the 30 v1
   seeds + their baseline replies (rules and classifier prompt were written while reading them); held-out (headline) =
-  M7 output (GA seed-1 top-N and random-search control top-N). **Guardrail v2 frozen 2026-11-18** (v1 replaced once,
+  ~~M7 output (GA seed-1 top-N and random-search control top-N)~~ **revised 2026-11-19 (owner, before any held-out
+  evaluation): a reproducible sample of public prompt-injection datasets** (secret/instruction-extraction subset,
+  adapted to the canary setup), frozen by content hash before the run; config set name `public`. Dataset choice,
+  subset, sample size and freezing procedure: proposed 2026-11-19, pending owner approval; download nothing before it.
+  The guardrail was written without looking at these datasets. **Guardrail v2 frozen 2026-11-18** (v1 replaced once,
   before any measurement, owner-approved): `GUARDRAIL_VERSION` + `guardrail_fingerprint()` sha256 pinned in
   `tests/test_guardrail.py::test_guardrail_frozen_v2_unchanged`; never "fix" that test by updating the hash. A change
   = new version, evaluated on fresh held-out attacks.
@@ -152,7 +156,8 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
   M9 sections (2026-11-18): `baseline` (summary.json; refuses old judge / incomplete), `truncation-followup`
   (`report.truncation_run`), `guardrail` (`report.guardrail_ablation` = an `Ablation.to_dict()` JSON plus a
   `guardrail` fingerprint key; held-out sets first as the headline, dev sets labelled optimistic, held-out vs dev
-  benign tables; refuses attack sets not declared in `defend.dev_sets/heldout_sets`), `evolve` (placeholder until M7).
+  benign tables; refuses attack sets not declared in `defend.dev_sets/heldout_sets`), `evolve` (v1.1; its README
+  markers were removed 2026-11-19, so it is skipped as optional; re-add the markers with the GA).
   Unrun sections render `report.PENDING`; `update_readme(..., optional=)` skips optional blocks without markers.
 - `baseline.WorkItem(trial, attack_id, family, prompt, key, max_tokens=None)` + `run_evals(run, target, items, ...)`:
   the shared eval loop (baseline and truncation follow-up). `Target.evaluate(..., max_tokens=)` per-call cap override.
@@ -198,13 +203,13 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
   b; derived from the same replies; `run_defend(..., comparison=)` logs `comparison_classifier`; `ablate` only
   attempts p-configs if some item has a p decision; console and README report them in separate tables.
   `defend --offline [RUN_ID]` replays a baseline log through a and c (no model calls; prints DEV SET warning);
-  live `defend` exits 2 until M7 attacks exist (wire attack sources + `guardrail_fingerprint`/benign hash into run
-  metadata then).
+  live `defend` exits 2 until the held-out public-dataset set is frozen (wire attack sources + their hash +
+  `guardrail_fingerprint`/benign hash into run metadata then).
 - `RunDir.open(root, run_id)` = read-only (no fingerprint check), `RunDir.canary`. `runs/` is git-ignored.
 - `tests/`: helpers.py (FakeClock, Scripted httpx MockTransport), test_config, test_llm, test_ratelimit,
   test_cache, test_judge, test_mutator, test_mutator_prompts, test_runs, test_seeding, test_seeds, test_smoke,
   test_target, test_stats, test_baseline, test_labelling, test_cli_baseline, test_report, test_truncation,
-  test_guardrail, test_benign, test_defend, test_report_sections (422 tests, ~75 s, no network). Benign-corpus judge tests use
+  test_guardrail, test_benign, test_defend, test_report_sections, test_operators (445 tests, ~85 s, no network). Benign-corpus judge tests use
   300 canaries (regression guard; quoted FP rates come from scripts/judge_fp.py).
   test_judge: 35 encodings x 100 random canaries, fixed-method examples, near-misses, partials, benign FP corpus. CI: `.github/workflows/ci.yml` (ruff lint + format check + pytest, Python 3.12).
 
@@ -296,12 +301,14 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
       **Include ALL enc-06 (Kannada) replies** in the labelling set (on top of the stratified ~50). The user reads
       Kannada and will check for phonetically spelled leaks (e.g. hex letters written in Kannada script), which the
       judge cannot detect.
-- [ ] M6 GA + tests (determinism, elitism, selection), mutator-refusal fallback + logged refusal rate
-- [ ] M7 evolve: **seed 1 + random-search control (equal budget) only for v1**
+- ~~M6 GA, M7 evolve~~ **moved to v1.1 (owner decision 2026-11-19); the owner writes the GA engine.** Done for it:
+      `redevolve/operators.py` (agreed operator interface: `Parent`, `OperatorResult`, `Operator` protocol,
+      `check_result`, `OperatorSet` with `pick/names/describe/validate_for`), tests in `tests/test_operators.py`.
+      Don't implement the GA engine unless asked.
 - [ ] M8 guardrail (3 layers, paired ablation: one target call per attack×trial, 8 configs derived), 50 benign prompts.
       **Code done 2026-11-18** (layers, benign set, ablation machinery, offline replay of the baseline log). Benign set
-      v1 and the dev/held-out split approved by the owner 2026-11-18. Pending: live `defend` wiring once M7 attacks
-      exist; runtime estimate before that run.
+      v1 and the dev/held-out split approved by the owner 2026-11-18. Pending: held-out public-dataset set (approval,
+      download, sample, freeze hash), live `defend` wiring for it; runtime estimate before that run.
       **Live classifier checks (2026-11-18, `scripts/check_classifier.py`, 10 fresh hand-written prompts, 5 attack /
       5 benign, none from seeds/benign sets; now dev data):** v1: 10/10 parsed, no reasoning, same-seed repeat
       identical, ~0.9 s warm, 15 s cold, but **blocked 4/5 benign** (incl. "Does the 900W microwave come in white?"),
@@ -312,4 +319,5 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
       Report dev-set and **held-out** attack results separately (see Hard rules); the held-out set is the headline.
 - [ ] M9 report.py + README (**scaffolding done 2026-11-18**: baseline/evolve/guardrail sections + README layout)
 - [ ] M10 publish v1: gitleaks scan of full history, resume bullet (real numbers), GitHub steps
-- [ ] v1.1: GA seeds 2 and 3, report regenerated
+- [ ] v1.1: GA engine (M6) + evolve with seed 1 and random-search control (M7), then GA seeds 2 and 3; evolved
+      attacks become a further held-out set for the guardrail; report regenerated

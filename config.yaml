@@ -94,13 +94,17 @@ defend:
   # - dev: the 30 frozen v1 seed attacks and their baseline replies. The input-filter rules and
   #   the classifier prompt were written while reading them, so dev-set numbers are optimistic
   #   and are reported separately, never as the headline.
-  # - held-out (headline): attacks produced by M7 (the GA seed-1 top-N and the random-search
-  #   control top-N), which did not exist when the guardrail was frozen (GUARDRAIL_VERSION +
-  #   hash pinned in tests). The guardrail is never changed after seeing held-out results; a
-  #   change is a new guardrail version, re-run on fresh held-out attacks.
+  # - held-out (headline), REVISED 2026-11-19 by the owner, before any held-out evaluation: a
+  #   reproducible sample of public prompt-injection datasets (attacks aimed at extracting hidden
+  #   instructions/secrets), adapted to the canary setup and frozen by content hash before the
+  #   run. Originally this was the M7 GA/random-search output; the GA moved to v1.1 (future
+  #   work). The guardrail (v2, frozen 2026-11-18, GUARDRAIL_VERSION + hash pinned in tests) was
+  #   written without looking at these datasets. It is never changed after seeing held-out
+  #   results; a change is a new guardrail version, re-run on fresh held-out attacks.
+  #   Dataset choice, subset, sample size and freezing: pending owner approval (CLAUDE.md, M8).
   dev_sets: [seeds]
-  heldout_sets: [ga, control]
-  top_n: 20              # top attacks per held-out set replayed through the paired ablation
+  heldout_sets: [public]
+  top_n: 20              # v1.1 (GA): top attacks per GA/control set replayed through the ablation
   trials: 1              # K per attack; size it from measured speed before the live run
   benign_file: data/benign.yaml   # dev benign set: written alongside the guardrail
   # Held-out benign set: written by the owner without seeing the guardrail, kept outside the repo
