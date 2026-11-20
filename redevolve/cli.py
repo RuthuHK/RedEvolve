@@ -10,9 +10,16 @@ from pathlib import Path
 from typing import Any
 
 from . import baseline, defend, judge, labelling, report, truncation
-from .benign import BenignError, load_benign
+from .benign import BenignError, BenignSet, load_benign
 from .config import ConfigError, load_config
-from .guardrail import InputFilter, OutputFilter, guardrail_fingerprint
+from .guardrail import (
+    InjectionClassifier,
+    InputFilter,
+    OutputFilter,
+    PromptGuardClassifier,
+    guardrail_fingerprint,
+)
+from .heldout import HeldoutError, HeldoutSet, load_heldout
 from .llm import (
     ChatClient,
     ChatResult,
@@ -335,6 +342,7 @@ def cmd_report(cfg: dict[str, Any], *, baseline_run: str | None) -> int:
                 Path(rc["guardrail_ablation"]),
                 dev_sets=list(d.get("dev_sets", [])),
                 heldout_sets=list(d.get("heldout_sets", [])),
+                headline_sets=d.get("headline_sets"),
             )
             if rc.get("guardrail_ablation")
             else report.PENDING
@@ -468,19 +476,204 @@ def cmd_truncation(
     return 0
 
 
-def cmd_defend(cfg: dict[str, Any], *, offline: str | None) -> int:
-    """Paired guardrail ablation. Only ``--offline`` exists until the held-out set is frozen.
+ABLATION_FILE = "ablation.json"
+
+
+def _defend_inputs(
+    cfg: dict[str, Any],
+) -> tuple[SeedSet, dict[str, HeldoutSet], BenignSet, BenignSet | None] | None:
+    """Load the dev seeds, every held-out attack file, and both benign sets (None on error)."""
+    d = cfg.get("defend", {})
+    seeds = _load_seeds(cfg)
+    if seeds is None:
+        return None
+    unsupported = [s for s in d.get("dev_sets", []) if s != "seeds"]
+    files = d.get("heldout_attack_files") or {}
+    missing = [s for s in d.get("heldout_sets", []) if s not in files]
+    if unsupported or missing or not files:
+        _err(
+            "defend config: dev_sets may only contain 'seeds' "
+            f"(got extra {unsupported}); every heldout_sets entry needs a heldout_attack_files "
+            f"path (missing {missing})"
+        )
+        return None
+    try:
+        heldout = {name: load_heldout(files[name]) for name in d["heldout_sets"]}
+        benign = load_benign(d.get("benign_file", "data/benign.yaml"))
+        hb_path = d.get("heldout_benign_file")
+        hbenign = load_benign(hb_path) if hb_path else None
+    except (HeldoutError, BenignError) as e:
+        _err(str(e))
+        return None
+    wrong = [n for n, s in heldout.items() if s.name != n]
+    if wrong:
+        _err(f"held-out file name field differs from its config key: {wrong}")
+        return None
+    return seeds, heldout, benign, hbenign
+
+
+def _defend_meta(
+    cfg: dict[str, Any], heldout: dict[str, HeldoutSet], benign: BenignSet, hb: BenignSet | None
+) -> dict[str, Any]:
+    """What a defend run's results depend on beyond the run fingerprint (checked on resume)."""
+    d = cfg["defend"]
+    return {
+        "guardrail": guardrail_fingerprint(cfg),
+        "trials": d.get("trials", 1),
+        "benign_trials": d.get("benign_trials", 1),
+        "dev_sets": list(d.get("dev_sets", [])),
+        "heldout_sets": {
+            n: {
+                "sha256": s.sha256,
+                "n": len(s.attacks),
+                "transform": s.transform,
+                "source": s.source,
+            }
+            for n, s in heldout.items()
+        },
+        "benign_sha256": benign.sha256,
+        "heldout_benign_sha256": hb.sha256 if hb else None,
+    }
+
+
+def _defend_live(
+    cfg: dict[str, Any],
+    *,
+    resume: str | None,
+    limit: int | None,
+    allow_dirty: bool,
+    config_path: str | None,
+) -> int:
+    """Live paired ablation: dev seeds + held-out attack sets + both benign sets."""
+    inputs = _defend_inputs(cfg)
+    if inputs is None:
+        return 2
+    seeds, heldout, benign, hbenign = inputs
+    d, g = cfg["defend"], cfg.get("guardrail", {})
+    if not allow_dirty and environment_info().get("git_dirty"):
+        _err("the git tree has uncommitted changes (commit first, or pass --allow-dirty)")
+        return 2
+    canary = derive_canary(cfg["seed"])
+    trials = d.get("trials", 1)
+    sets: dict[str, list[tuple[str, str, str]]] = {
+        name: [(a.id, a.family, a.prompt) for a in s.attacks] for name, s in heldout.items()
+    }
+    if "seeds" in d.get("dev_sets", []):
+        sets["seeds"] = [(s.id, s.family, s.prompt) for s in seeds.seeds]
+    work = defend.attack_work(sets, trials)
+    bt = d.get("benign_trials", 1)
+    work += defend.benign_work(benign, bt)
+    if hbenign is not None:
+        work += defend.benign_work(hbenign, bt, set_name=defend.HELDOUT_BENIGN_SET)
+    meta = _defend_meta(cfg, heldout, benign, hbenign)
+    comparison = None
+    try:  # before the run dir exists, so a missing key doesn't leave an empty run behind
+        if cfg.get("comparison_classifier"):
+            key = load_groq_key()
+            if not key:
+                _err("comparison classifier needs GROQ_API_KEY (in .env)")
+                return 2
+            comparison = PromptGuardClassifier.from_config(cfg, key)
+    except (LLMError, OSError, ValueError) as e:
+        _err(f"comparison classifier: {e}")
+        return 2
+    root = _runs_root(cfg)
+    try:
+        if resume:
+            run = RunDir.resume(root, resume, cfg, seeds=seeds, canary=canary)
+            changed = [k for k, v in meta.items() if run.meta.get(k) != v]
+            if changed:
+                _err(f"can't resume {resume}: {', '.join(changed)} differ from that run")
+                return 2
+        else:
+            run = RunDir.create(root, defend.KIND, cfg, seeds=seeds, canary=canary, extra=meta)
+    except RunError as e:
+        _err(str(e))
+        return 2
+    cfg_flag = f" --config {config_path}" if config_path else ""
+    hint = f"python -m redevolve defend --resume {run.run_id}{cfg_flag}"
+    n_att = sum(len(v) for v in sets.values())
+    print(
+        f"run {run.run_id}: {n_att} attacks ({', '.join(f'{k} {len(v)}' for k, v in sets.items())})"
+        f" x K={trials} + benign x {bt} = {len(work)} paired evaluations, guardrail "
+        f"v{meta['guardrail']['version']} {meta['guardrail']['sha256'][:12]}"
+    )
+    print(f"  Ctrl-C pauses safely; resume with: {hint}")
+    out_f = OutputFilter(canary, replacement=g.get("output_replacement", "[REDACTED]"))
+    try:
+        outcome = defend.run_defend(
+            run,
+            Target.from_config(cfg, canary),
+            input_filter=InputFilter(threshold=g.get("input_filter_threshold", 2)),
+            classifier=InjectionClassifier.from_config(cfg),
+            output_filter=out_f,
+            work=work,
+            comparison=comparison,
+            run_seed=cfg["seed"],
+            limit=limit,
+        )
+    except LLMError as e:
+        _err(f"a model call failed ({type(e).__name__}: {e}); run paused. Then: {hint}")
+        return 1
+    except KeyboardInterrupt:
+        print(f"\ninterrupted; run paused. Resume with: {hint}", file=sys.stderr)
+        return 130
+    if not outcome.complete:
+        print(f"\npaused ({outcome.total_done}/{outcome.total}). Resume with: {hint}")
+        return 0
+    return _defend_summarize(cfg, run)
+
+
+def _defend_summarize(cfg: dict[str, Any], run: RunDir) -> int:
+    """Ablate a finished defend run's log -> ``ablation.json`` (+ guardrail fingerprint)."""
+    g = cfg.get("guardrail", {})
+    in_f = InputFilter(threshold=g.get("input_filter_threshold", 2))
+    out_f = OutputFilter(run.canary, replacement=g.get("output_replacement", "[REDACTED]"))
+    items = defend.items_from_records(
+        run.records("eval"),
+        canary=run.canary,
+        input_filter=in_f,
+        output_filter=out_f,
+        default_set="unlabelled",  # defend records always carry a set; report refuses this one
+    )
+    ab = defend.ablate(
+        items,
+        canary=run.canary,
+        block_message=g.get("block_message", ""),
+        run_seed=cfg["seed"],
+        n_boot=cfg.get("baseline", {}).get("bootstrap_resamples", 10_000),
+    )
+    print("\n" + defend.format_ablation(ab))
+    data = {**ab.to_dict(), "guardrail": run.meta.get("guardrail") or guardrail_fingerprint(cfg)}
+    out = run.path / ABLATION_FILE
+    out.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    print(f"\nwritten to {out}; set report.guardrail_ablation to it, then run `report`")
+    return 0
+
+
+def cmd_defend(
+    cfg: dict[str, Any],
+    *,
+    offline: str | None,
+    resume: str | None = None,
+    limit: int | None = None,
+    allow_dirty: bool = False,
+    config_path: str | None = None,
+    summarize: str | None = None,
+) -> int:
+    """Paired guardrail ablation: live (default), ``--summarize RUN_ID`` or ``--offline``.
 
     Offline mode replays a baseline run's logged replies through layers (a) and (c) (pure
     Python, no model calls). Those are the dev-set attacks, so the numbers are optimistic.
     Layer (b) needs live classifier calls and is left out.
     """
+    if summarize:
+        run = _open_run(cfg, summarize)
+        return 2 if run is None else _defend_summarize(load_config(run.path / CONFIG_FILE), run)
     if offline is None:
-        _err(
-            "the live defend run needs the held-out attack set (public datasets), which isn't "
-            "frozen yet; use --offline [BASELINE_RUN] to replay the baseline's replies"
+        return _defend_live(
+            cfg, resume=resume, limit=limit, allow_dirty=allow_dirty, config_path=config_path
         )
-        return 2
     run = _open_run(cfg, offline)
     if run is None:
         return 2
@@ -563,6 +756,10 @@ def main(argv: list[str] | None = None) -> int:
         metavar="RUN_ID",
         help="replay a baseline run's replies through layers a and c (default: the report run)",
     )
+    de.add_argument("--resume", metavar="RUN_ID", help="continue a paused defend run")
+    de.add_argument("--limit", type=int, metavar="N", help="pause after N new evaluations")
+    de.add_argument("--allow-dirty", action="store_true", help="allow uncommitted changes")
+    de.add_argument("--summarize", metavar="RUN_ID", help="re-ablate a defend run's log")
     args = p.parse_args(argv)
     try:
         cfg = load_config(args.config)
@@ -607,7 +804,18 @@ def main(argv: list[str] | None = None) -> int:
             if not offline:
                 _err("pass --offline RUN_ID or set report.baseline_run in config.yaml")
                 return 2
-        return cmd_defend(cfg, offline=offline)
+        if args.limit is not None and args.limit < 1:
+            _err("--limit must be at least 1")
+            return 2
+        return cmd_defend(
+            cfg,
+            offline=offline,
+            resume=args.resume,
+            limit=args.limit,
+            allow_dirty=args.allow_dirty,
+            config_path=args.config,
+            summarize=args.summarize,
+        )
     return 1
 
 

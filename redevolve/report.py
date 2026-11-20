@@ -325,11 +325,18 @@ def _is_cmp(row: dict[str, Any]) -> bool:
     return "p" in row["config"].split("+")
 
 
-def guardrail_section(ablation_path: Path, *, dev_sets: list[str], heldout_sets: list[str]) -> str:
+def guardrail_section(
+    ablation_path: Path,
+    *,
+    dev_sets: list[str],
+    heldout_sets: list[str],
+    headline_sets: list[str] | None = None,
+) -> str:
     """Markdown for the paired guardrail ablation (``Ablation.to_dict()`` JSON).
 
-    Held-out attack sets come first (they are the headline); dev sets follow under an explicit
-    "optimistic" heading. The dev and held-out benign sets get separate tables.
+    Headline held-out attack sets come first, then other held-out sets (variants, labelled as
+    not the headline; ``headline_sets`` defaults to all held-out sets), then dev sets under an
+    explicit "optimistic" heading. The dev and held-out benign sets get separate tables.
 
     Raises:
         ReportError: If the file is missing, from another judge version, or contains an attack
@@ -349,8 +356,16 @@ def guardrail_section(ablation_path: Path, *, dev_sets: list[str], heldout_sets:
     if "guardrail" in ab:
         g = ab["guardrail"]
         lines += [f"Guardrail v{g['version']} (`{g['sha256'][:12]}`).", ""]
+    headline = heldout_sets if headline_sets is None else headline_sets
+    bad = [s for s in headline if s not in heldout_sets]
+    if bad:
+        raise ReportError(f"headline sets must be held-out sets: {bad}")
     for title, group in (
-        ("Held-out attacks (headline: not seen while designing the guardrail)", heldout_sets),
+        ("Held-out attacks (headline: not seen while designing the guardrail)", headline),
+        (
+            "Held-out variant (reported separately, not the headline)",
+            [s for s in heldout_sets if s not in headline],
+        ),
         ("Dev attacks (the guardrail was designed while reading these: optimistic)", dev_sets),
     ):
         for s in (x for x in sets if x in group):

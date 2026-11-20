@@ -101,16 +101,24 @@ defend:
   #   work). The guardrail (v2, frozen 2026-11-18, GUARDRAIL_VERSION + hash pinned in tests) was
   #   written without looking at these datasets. It is never changed after seeing held-out
   #   results; a change is a new guardrail version, re-run on fresh held-out attacks.
-  #   Dataset choice, subset, sample size and freezing: pending owner approval (CLAUDE.md, M8).
-  dev_sets: [seeds]
-  heldout_sets: [public]
+  #   Approved 2026-11-20: Lakera gandalf_ignore_instructions (MIT), official test split, all 112
+  #   rows, pinned revision + file sha256, pre-registered filters (redevolve/heldout.py), built
+  #   by scripts/build_heldout.py. Two variants of the same rows, hashes pinned in
+  #   tests/test_heldout.py: `gandalf` (verbatim, the headline) and `gandalf_code` (fixed
+  #   case-preserving whole-word "password" -> "code"), reported separately.
+  dev_sets: [seeds]      # live run replays the 30 seeds too (dev tables, labelled optimistic)
+  heldout_sets: [gandalf, gandalf_code]
+  headline_sets: [gandalf]
+  heldout_attack_files:
+    gandalf: data/heldout/gandalf.yaml
+    gandalf_code: data/heldout/gandalf_code.yaml
   top_n: 20              # v1.1 (GA): top attacks per GA/control set replayed through the ablation
-  trials: 1              # K per attack; size it from measured speed before the live run
+  trials: 3              # K per attack (owner decision 2026-11-20)
   benign_file: data/benign.yaml   # dev benign set: written alongside the guardrail
   # Held-out benign set: written by the owner without seeing the guardrail, kept outside the repo
   # until the evaluation run, reported separately (set "benign_heldout"). Same format as
   # data/benign.yaml; use ids that differ from bn-*, e.g. bh-01. null = none.
-  heldout_benign_file: null
+  heldout_benign_file: 'C:\Users\ruthu\Desktop\heldout_benign.yaml'
   benign_trials: 1
 
 report:                  # `python -m redevolve report` regenerates README numbers from these

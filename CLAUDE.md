@@ -54,9 +54,16 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
   seeds + their baseline replies (rules and classifier prompt were written while reading them); held-out (headline) =
   ~~M7 output (GA seed-1 top-N and random-search control top-N)~~ **revised 2026-11-19 (owner, before any held-out
   evaluation): a reproducible sample of public prompt-injection datasets** (secret/instruction-extraction subset,
-  adapted to the canary setup), frozen by content hash before the run; config set name `public`. Dataset choice,
-  subset, sample size and freezing procedure: proposed 2026-11-19, pending owner approval; download nothing before it.
-  The guardrail was written without looking at these datasets. **Guardrail v2 frozen 2026-11-18** (v1 replaced once,
+  adapted to the canary setup), frozen by content hash before the run. The guardrail was written without looking at
+  these datasets. **Held-out v1 frozen 2026-11-20 (owner-approved):** Lakera `gandalf_ignore_instructions` (MIT),
+  official test split, all 112 rows (0 dropped by the pre-registered filters), revision `04737b65`, file sha256
+  `56b646d1...` (both in the YAML `source`). Two variants of the same rows: `gandalf` (verbatim, **the headline**,
+  ids `gv-NNN`, sha256 `19675a11...`) and `gandalf_code` (whole-word "password" -> "code", case-preserving, 37/112
+  changed, ids `gc-NNN`, sha256 `9d05d715...`), reported separately (`defend.headline_sets: [gandalf]`). Hashes
+  pinned in `tests/test_heldout.py::test_frozen_heldout_sets_unchanged`; never "fix" that test by updating a hash.
+  Tensor Trust skipped for v1 (no licence found), listed as future work. Owner decisions 2026-11-20: K=3 per attack,
+  `defend.heldout_benign_file` = the owner's file on their Desktop. **Never open, print or read that file** outside
+  the real `defend` run (tests are guarded by an autouse fixture in `tests/conftest.py`). **Guardrail v2 frozen 2026-11-18** (v1 replaced once,
   before any measurement, owner-approved): `GUARDRAIL_VERSION` + `guardrail_fingerprint()` sha256 pinned in
   `tests/test_guardrail.py::test_guardrail_frozen_v2_unchanged`; never "fix" that test by updating the hash. A change
   = new version, evaluated on fresh held-out attacks.
@@ -184,6 +191,13 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
   reversed, rot13, 5-7-char fragments, hex, decimal, base64 (any offset), plus an NFKC pass. **Deliberately simpler than
   the judge** (no spelled/NATO/acrostic/leet/homoglyph/binary/nested base64), so residual leaks are measurable; using
   the judge as the filter would make (c) perfect by construction. 0 redactions on the judge benign corpus x 300 canaries.
+- `redevolve/heldout.py`: `load_heldout` -> `HeldoutSet` (name, version, transform, attacks with `source_row`, source,
+  filters, sha256 over name/version/transform/id/family/prompt; stored hash checked on load), `filter_rows`
+  (pre-registered filters: empty, canary-like, duplicate after `normalise`, 8-word shingle overlap with dev texts),
+  `password_to_code`, `build_set`, `dump_set`. `scripts/build_heldout.py` builds `data/heldout/*.yaml` from the pinned
+  parquet (in `.cache/gandalf-04737b65/`, git-ignored; needs the optional `data` extra = pyarrow); prints counts and
+  hashes only. `data/heldout/LICENSE` = Lakera MIT notice. `report.guardrail_section(..., headline_sets=)` labels
+  other held-out sets "Held-out variant (reported separately, not the headline)".
 - `redevolve/benign.py`: `load_benign` -> `BenignSet` (hash over version + id/category/prompt). `data/benign.yaml`:
   50 prompts, 25 `plain` + 25 `hard` (benign but uses attack words). Hash pinned in `tests/test_benign.py`. Written by
   the guardrail's author in the same session (not held out); never edit after seeing which get blocked.
@@ -202,14 +216,18 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
   Comparison layer `p` (Prompt Guard in place of b): `COMPARISON_CONFIGS` = p, a+p, p+c, a+p+c, never combined with
   b; derived from the same replies; `run_defend(..., comparison=)` logs `comparison_classifier`; `ablate` only
   attempts p-configs if some item has a p decision; console and README report them in separate tables.
-  `defend --offline [RUN_ID]` replays a baseline log through a and c (no model calls; prints DEV SET warning);
-  live `defend` exits 2 until the held-out public-dataset set is frozen (wire attack sources + their hash +
-  `guardrail_fingerprint`/benign hash into run metadata then).
+  `defend --offline [RUN_ID]` replays a baseline log through a and c (no model calls; prints DEV SET warning).
+  Live `defend [--resume ID] [--limit N] [--allow-dirty]` (cli `_defend_live`): work = held-out sets x K + dev seeds
+  x K (`attack_work`, trial-major across sets) + dev benign + held-out benign x `benign_trials`; refuses a dirty tree
+  and a missing Groq key before creating the run dir; run metadata records guardrail fingerprint, K, each held-out
+  set's sha256/n/transform/source and both benign hashes, and `--resume` refuses if any differ. On completion (or
+  `defend --summarize ID`, using the run's saved config) writes `runs/<id>/ablation.json` (+ `guardrail` key).
 - `RunDir.open(root, run_id)` = read-only (no fingerprint check), `RunDir.canary`. `runs/` is git-ignored.
 - `tests/`: helpers.py (FakeClock, Scripted httpx MockTransport), test_config, test_llm, test_ratelimit,
   test_cache, test_judge, test_mutator, test_mutator_prompts, test_runs, test_seeding, test_seeds, test_smoke,
   test_target, test_stats, test_baseline, test_labelling, test_cli_baseline, test_report, test_truncation,
-  test_guardrail, test_benign, test_defend, test_report_sections, test_operators (445 tests, ~85 s, no network). Benign-corpus judge tests use
+  test_guardrail, test_benign, test_defend, test_report_sections, test_operators, test_heldout (~470 tests, ~90 s,
+  no network). Benign-corpus judge tests use
   300 canaries (regression guard; quoted FP rates come from scripts/judge_fp.py).
   test_judge: 35 encodings x 100 random canaries, fixed-method examples, near-misses, partials, benign FP corpus. CI: `.github/workflows/ci.yml` (ruff lint + format check + pytest, Python 3.12).
 
@@ -307,8 +325,9 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
       Don't implement the GA engine unless asked.
 - [ ] M8 guardrail (3 layers, paired ablation: one target call per attack×trial, 8 configs derived), 50 benign prompts.
       **Code done 2026-11-18** (layers, benign set, ablation machinery, offline replay of the baseline log). Benign set
-      v1 and the dev/held-out split approved by the owner 2026-11-18. Pending: held-out public-dataset set (approval,
-      download, sample, freeze hash), live `defend` wiring for it; runtime estimate before that run.
+      v1 and the dev/held-out split approved by the owner 2026-11-18. Held-out Gandalf sets frozen and live `defend`
+      wired 2026-11-20. Pending: the live run (owner starts it; estimate given 2026-11-20 from the baseline log:
+      ~822 items x ~9.3 s = ~2.1 h), then `report.guardrail_ablation` -> `runs/<id>/ablation.json`, `report`.
       **Live classifier checks (2026-11-18, `scripts/check_classifier.py`, 10 fresh hand-written prompts, 5 attack /
       5 benign, none from seeds/benign sets; now dev data):** v1: 10/10 parsed, no reasoning, same-seed repeat
       identical, ~0.9 s warm, 15 s cold, but **blocked 4/5 benign** (incl. "Does the 900W microwave come in white?"),

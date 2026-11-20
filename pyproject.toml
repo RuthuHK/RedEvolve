@@ -21,6 +21,10 @@ dev = [
     "pytest~=9.2",
     "ruff~=0.17",
 ]
+# Only for scripts/build_heldout.py (reads the pinned parquet); the frozen YAML is committed.
+data = [
+    "pyarrow~=26.0",
+]
 
 [project.scripts]
 redevolve = "redevolve.cli:main"

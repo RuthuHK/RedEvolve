@@ -524,6 +524,20 @@ def benign_work(benign: BenignSet, trials: int, *, set_name: str = BENIGN_SET) -
     ]
 
 
+def attack_work(sets: dict[str, list[tuple[str, str, str]]], trials: int) -> list[DefendWork]:
+    """Every attack x ``trials``, trial-major across sets (a paused run stays balanced).
+
+    Args:
+        sets: Set name -> list of (id, family, prompt), in file order.
+    """
+    return [
+        DefendWork(name, aid, fam, prompt, t)
+        for t in range(trials)
+        for name, items in sets.items()
+        for aid, fam, prompt in items
+    ]
+
+
 def run_defend(
     run: RunDir,
     target: Target,

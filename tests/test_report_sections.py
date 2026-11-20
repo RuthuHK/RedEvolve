@@ -103,6 +103,7 @@ def test_report_renders_placeholders_and_guardrail(setup, tmp_path: Path) -> Non
 
     cfg["report"]["guardrail_ablation"] = str(write_ablation(tmp_path))
     cfg["defend"]["heldout_sets"] = ["ga"]
+    cfg["defend"]["headline_sets"] = ["ga"]
     path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
     assert cli.main(["--config", str(path), "report"]) == 0
     text = readme.read_text(encoding="utf-8")
@@ -126,3 +127,16 @@ def test_guardrail_section_reports_comparison_separately(tmp_path: Path) -> None
     assert "| a+b+c |" in main and "| a+p+c |" not in main
     assert "| a+p+c |" in cmp_part and "| none |" in cmp_part
     assert "*Comparison classifier: Llama Prompt Guard" in text
+
+
+def test_guardrail_section_labels_non_headline_heldout_sets(tmp_path: Path) -> None:
+    p = write_ablation(tmp_path)
+    # treat "seeds" as a held-out variant here, just to exercise the three groups
+    text = report.guardrail_section(
+        p, dev_sets=[], heldout_sets=["ga", "seeds"], headline_sets=["ga"]
+    )
+    head = text.index("Held-out attacks (headline")
+    var = text.index("Held-out variant (reported separately, not the headline): `seeds`")
+    assert head < var and "`ga`" in text[head:var]
+    with pytest.raises(report.ReportError, match="headline sets"):
+        report.guardrail_section(p, dev_sets=[], heldout_sets=["ga", "seeds"], headline_sets=["x"])
