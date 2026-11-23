@@ -123,10 +123,49 @@ def test_guardrail_section_reports_comparison_separately(tmp_path: Path) -> None
     p = tmp_path / "ablation.json"
     p.write_text(json.dumps(ab), encoding="utf-8")
     text = report.guardrail_section(p, dev_sets=[], heldout_sets=["ga"])
-    main, _, cmp_part = text.partition("*Comparison classifier on `ga`")
+    summary, _, per_set = text.partition("**Held-out attacks (headline")
+    head_main, _, head_cmp = summary.partition("*Comparison classifier: Llama Prompt Guard")
+    assert "| a+b+c |" in head_main and "| a+p+c |" not in head_main
+    assert "| a+p+c |" in head_cmp
+    main, _, cmp_part = per_set.partition("*Comparison classifier on `ga`")
     assert "| a+b+c |" in main and "| a+p+c |" not in main
     assert "| a+p+c |" in cmp_part and "| none |" in cmp_part
-    assert "*Comparison classifier: Llama Prompt Guard" in text
+
+
+def test_guardrail_section_floor_check_spontaneous_leaks_and_stalls(tmp_path: Path) -> None:
+    p = write_ablation(tmp_path)
+    d = json.loads(p.read_text(encoding="utf-8"))
+    text = report.guardrail_section(p, dev_sets=["seeds"], heldout_sets=["ga"])
+    assert "**Headline: block rate on the held-out attacks**" in text
+    # 1 undefended leak in `ga`: the best possible exact McNemar p is 1
+    assert "Floor check on `ga`" in text and "not measurable" in text
+    assert "Leak reduction is reported on the dev set `seeds`" in text
+    dev_benign = text.split("**Dev benign")[1]
+    assert "Spontaneous leaks (benign prompt, no guardrail" in dev_benign and "0/1" in dev_benign
+    assert "| earlier definition |" in text and "Per-call latency by layer" in text
+    # stalled rows show latency without the stalls too
+    d["attacks"][0].update(stalled=2, mean_added_latency_excl_stalls_s=0.1,
+                           p95_added_latency_excl_stalls_s=0.2)  # fmt: skip
+    p.write_text(json.dumps(d), encoding="utf-8")
+    assert "(excl. 2 stalled: 100 / 200 ms)" in report.guardrail_section(
+        p, dev_sets=["seeds"], heldout_sets=["ga"]
+    )
+    d["fp_definition"] = 1
+    p.write_text(json.dumps(d), encoding="utf-8")
+    with pytest.raises(report.ReportError, match="false-positive definition"):
+        report.guardrail_section(p, dev_sets=["seeds"], heldout_sets=["ga"])
+
+
+def test_spontaneous_leak_line() -> None:
+    rows = [
+        {
+            "config": "none",
+            "spontaneous": ["benign:bn-48:0"],
+            "spontaneous_leak": {"k": 1, "n": 50, "rate": 0.02, "ci_low": 0.0, "ci_high": 0.1},
+        }
+    ]
+    (line, _) = report._spontaneous_line(rows)
+    assert "1/50" in line and "`bn-48`" in line
 
 
 def test_guardrail_section_labels_non_headline_heldout_sets(tmp_path: Path) -> None:

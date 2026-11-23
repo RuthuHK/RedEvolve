@@ -28,7 +28,7 @@ import yaml
 from . import judge, labelling
 from .baseline import rejudge, verdict_label
 from .runs import RunDir
-from .stats import wilson
+from .stats import mcnemar_exact, wilson
 
 BEGIN = "<!-- BEGIN GENERATED: {name} -->"
 END = "<!-- END GENERATED: {name} -->"
@@ -284,6 +284,17 @@ def baseline_section(run: RunDir) -> str:
     return "\n".join(lines)
 
 
+def _latency(r: dict[str, Any]) -> str:
+    """Mean / p95 added latency; for rows with network stalls, also without them."""
+    text = f"{r['mean_added_latency_s'] * 1000:.0f} / {r['p95_added_latency_s'] * 1000:.0f} ms"
+    if r.get("stalled"):
+        text += (
+            f" (excl. {r['stalled']} stalled: {r['mean_added_latency_excl_stalls_s'] * 1000:.0f}"
+            f" / {r['p95_added_latency_excl_stalls_s'] * 1000:.0f} ms)"
+        )
+    return text
+
+
 def _ablation_table(rows: list[dict[str, Any]]) -> list[str]:
     out = [
         "| layers | full-leak ASR | cluster bootstrap 95% CI | blocked | redacted | "
@@ -296,26 +307,128 @@ def _ablation_table(rows: list[dict[str, Any]]) -> list[str]:
             f"| {r['config']} | {_pct(r['full']['rate'])} ({r['full']['k']}/{r['full']['n']}) | "
             f"{_ci(*ci) if ci else '-'} | {_pct(r['blocked']['rate'])} | "
             f"{_pct(r['redacted']['rate'])} | {r['fixed_vs_none']} | "
-            f"{r['mcnemar_p_vs_none']:.2g} | {r['mean_added_latency_s'] * 1000:.0f} / "
-            f"{r['p95_added_latency_s'] * 1000:.0f} ms |"
+            f"{r['mcnemar_p_vs_none']:.2g} | {_latency(r)} |"
         )
     return out
 
 
 def _benign_table(rows: list[dict[str, Any]]) -> list[str]:
     out = [
-        "| layers | false-positive rate | Wilson 95% CI | blocked | redacted | "
-        "added latency (mean / p95) |",
-        "|---|---|---|---|---|---|",
+        "| layers | false-positive rate | Wilson 95% CI | earlier definition | blocked | "
+        "redacted | leaks reaching the user | added latency (mean / p95) |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
-        fp = r["false_positive"]
+        fp, v1 = r["false_positive"], r["false_positive_v1"]
         out.append(
             f"| {r['config']} | {_pct(fp['rate'])} ({fp['k']}/{fp['n']}) | "
-            f"{_ci(fp['ci_low'], fp['ci_high'])} | {r['blocked']['k']} | {r['redacted']['k']} | "
-            f"{r['mean_added_latency_s'] * 1000:.0f} / {r['p95_added_latency_s'] * 1000:.0f} ms |"
+            f"{_ci(fp['ci_low'], fp['ci_high'])} | {_pct(v1['rate'])} ({v1['k']}/{v1['n']}) | "
+            f"{r['blocked']['k']} | {r['redacted']['k']} | {r['residual_leak']['k']} | "
+            f"{_latency(r)} |"
         )
     return out
+
+
+def _spontaneous_line(rows: list[dict[str, Any]]) -> list[str]:
+    """One line on benign replies that leaked with no guardrail at all."""
+    none = next((r for r in rows if r["config"] == "none"), None)
+    if none is None:
+        return []
+    sp = none["spontaneous_leak"]
+    keys = ", ".join(f"`{k.split(':')[1]}`" for k in none["spontaneous"]) or "none"
+    return [
+        f"Spontaneous leaks (benign prompt, no guardrail, reply leaked the canary): "
+        f"{sp['k']}/{sp['n']} ({_pct(sp['rate'])}, Wilson 95% CI "
+        f"{_ci(sp['ci_low'], sp['ci_high'])}): {keys}.",
+        "",
+    ]
+
+
+def _headline_summary(ab: dict[str, Any], headline: list[str], dev_sets: list[str]) -> list[str]:
+    """Block rate on the headline sets (the v1 headline), the floor-effect check, and the
+    leak reduction on the dev sets (optimistic)."""
+    lines: list[str] = []
+    configs = [r["config"] for r in ab["attacks"] if r["set"] == headline[0]] if headline else []
+    rows = {(r["set"], r["config"]): r for r in ab["attacks"]}
+    benign = {(r["set"], r["config"]): r for r in ab["benign"]}
+    if not configs:
+        return lines
+    head = " | ".join(f"blocked: `{s}` (cluster bootstrap 95% CI)" for s in headline)
+    bsets = [b for b in ("benign_heldout", "benign") if (b, "none") in benign]
+    bhead = "".join(f" | false positives: `{b}`" for b in bsets)
+
+    def table(cs: list[str]) -> list[str]:
+        out = [f"| layers | {head}{bhead} |", "|---|" + "---|" * (len(headline) + len(bsets))]
+        for c in cs:
+            cells = []
+            for hs in headline:
+                r = rows[(hs, c)]
+                b, ci = r["blocked"], r.get("blocked_cluster_ci")
+                cells.append(f"{_pct(b['rate'])} ({b['k']}/{b['n']}) {_ci(*ci) if ci else '-'}")
+            for bs in bsets:
+                fp = benign.get((bs, c), {}).get("false_positive")
+                cells.append(f"{fp['k']}/{fp['n']}" if fp else "-")
+            out.append(f"| {c} | " + " | ".join(cells) + " |")
+        return [*out, ""]
+
+    main = [c for c in configs if c != "none" and not _is_cmp({"config": c})]
+    cmp_ = [c for c in configs if _is_cmp({"config": c})]
+    lines += ["**Headline: block rate on the held-out attacks**", "", *table(main)]
+    if cmp_:
+        lines += [f"*Comparison classifier: {CMP_TITLE}*", "", *table(cmp_)]
+    for s in headline:
+        base = rows[(s, "none")]["full"]
+        best_p = mcnemar_exact(base["k"], 0)
+        verdict = (
+            "too few to show a significant reduction even if every one were stopped, so leak "
+            "reduction is not measurable on this set; the block rate is the held-out headline"
+            if best_p >= 0.05
+            else "enough for a reduction to be testable"
+        )
+        lines += [
+            f"Floor check on `{s}`: with no guardrail {base['k']}/{base['n']} replies leaked "
+            f"({_pct(base['rate'])}). The smallest exact McNemar p any configuration could reach "
+            f"is {best_p:.2g}: {verdict}.",
+            "",
+        ]
+    for s in dev_sets:
+        if (s, "none") in rows and (s, "a+b+c") in rows:
+            n0, n1 = rows[(s, "none")]["full"], rows[(s, "a+b+c")]
+            lines += [
+                f"Leak reduction is reported on the dev set `{s}` (optimistic: the guardrail was "
+                f"designed on it): full-leak ASR {n0['k']}/{n0['n']} with no guardrail vs "
+                f"{n1['full']['k']}/{n1['full']['n']} with a+b+c, exact McNemar "
+                f"p = {n1['mcnemar_p_vs_none']:.2g}.",
+                "",
+            ]
+    return lines
+
+
+def _layer_latency_table(ab: dict[str, Any]) -> list[str]:
+    ll = ab.get("layer_latency") or {}
+    if not ll:
+        return []
+    thr = ab.get("network_stall_s", 10.0)
+    names = {
+        "a": "a: input filter (re-timed at summary)",
+        "b": "b: classifier (local qwen3:1.7b)",
+        "p": "p: Prompt Guard (Groq API)",
+        "c": "c: output filter (re-timed at summary)",
+    }
+    out = [
+        "*Per-call latency by layer (all sets)*",
+        "",
+        f"| layer | calls | median | p95 | max | calls over {thr:.0f} s | p95 / max without them |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for k, v in ll.items():
+        out.append(
+            f"| {names.get(k, k)} | {v['n']} | {v['median_s'] * 1000:.0f} ms | "
+            f"{v['p95_s'] * 1000:.0f} ms | {v['max_s']:.1f} s | {v['over_stall_threshold']} | "
+            f"{v['p95_excl_over_threshold_s'] * 1000:.0f} ms / "
+            f"{v['max_excl_over_threshold_s']:.1f} s |"
+        )
+    return [*out, ""]
 
 
 CMP_TITLE = "Llama Prompt Guard 2 86M (`p`) in place of the classifier (`b`)"
@@ -348,6 +461,11 @@ def guardrail_section(
             f"{ablation_path} is for judge v{ab['judge_version']}, current is "
             f"v{judge.JUDGE_VERSION}: re-summarise the defend run"
         )
+    if ab.get("fp_definition") != 2:
+        raise ReportError(
+            f"{ablation_path} uses an older false-positive definition: re-summarise the defend "
+            "run (python -m redevolve defend --summarize RUN_ID)"
+        )
     sets = list(dict.fromkeys(r["set"] for r in ab["attacks"]))
     undeclared = [s for s in sets if s not in dev_sets and s not in heldout_sets]
     if undeclared:
@@ -360,6 +478,7 @@ def guardrail_section(
     bad = [s for s in headline if s not in heldout_sets]
     if bad:
         raise ReportError(f"headline sets must be held-out sets: {bad}")
+    lines += _headline_summary(ab, [s for s in headline if s in sets], dev_sets)
     for title, group in (
         ("Held-out attacks (headline: not seen while designing the guardrail)", headline),
         (
@@ -384,7 +503,8 @@ def guardrail_section(
     ):
         rows = [r for r in ab["benign"] if r.get("set", "benign") == s]
         if rows:
-            lines += [f"**{title}**", "", *_benign_table([r for r in rows if not _is_cmp(r)]), ""]
+            lines += [f"**{title}**", "", *_spontaneous_line(rows)]
+            lines += [*_benign_table([r for r in rows if not _is_cmp(r)]), ""]
             cmp_rows = [r for r in rows if _is_cmp(r) or r["config"] == "none"]
             if len(cmp_rows) > 1:
                 lines += [f"*Comparison classifier: {CMP_TITLE}*", "", *_benign_table(cmp_rows), ""]
@@ -392,6 +512,13 @@ def guardrail_section(
         lines.append(
             f"Not evaluated (no classifier decisions): {', '.join(ab['skipped_configs'])}."
         )
+    lines += _layer_latency_table(ab)
+    lines.append(
+        "False positive = a benign prompt that was blocked, or whose reply (c) changed although "
+        "it did not leak; *earlier definition* also counted (c) redacting a spontaneous leak. "
+        f"Stalled = a Prompt Guard call over {ab.get('network_stall_s', 10.0):.0f} s."
+    )
+    lines.append("")
     lines.append(
         "All layer combinations are judged on the same target replies (one call per attack x "
         "trial), so *fixed vs none* counts paired outcomes and the McNemar test is exact."

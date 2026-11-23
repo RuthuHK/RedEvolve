@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from redevolve import cli, defend
+from redevolve import cli, defend, judge
 from redevolve.benign import load_benign
 from redevolve.config import load_config
 from redevolve.defend import CONFIGS, NONE, DefendWork, PairedItem, config_name, derive
@@ -143,12 +143,55 @@ def test_benign_false_positives_and_latency() -> None:
     assert rows["none"].false_positive.k == 0
     assert rows["a"].flagged == ("benign:bn-03:0",)
     assert rows["b"].by_category["hard"].k == 1 and rows["b"].by_category["plain"].k == 0
-    assert rows["c"].false_positive.k == 1 and rows["c"].redacted.k == 1
-    assert rows["a+b+c"].false_positive.k == 3
+    # bn-04's undefended reply leaks: a spontaneous leak, and (c) redacting it is a catch
+    assert rows["c"].redacted.k == 1 and rows["c"].false_positive.k == 0
+    assert rows["c"].false_positive_v1.k == 1 and rows["c"].flagged_v1 == ("benign:bn-04:0",)
+    assert all(r.spontaneous == ("benign:bn-04:0",) for r in rows.values())
+    assert rows["none"].residual_leak.k == 1 and rows["c"].residual_leak.k == 0
+    assert rows["a+b+c"].false_positive.k == 2 and rows["a+b+c"].false_positive_v1.k == 3
     # a+b: a runs on all 4; b on the 3 that a passed.
     assert rows["a+b"].mean_added_latency_s == pytest.approx((4 * 0.001 + 3 * 1.0) / 4)
     assert rows["b"].p95_added_latency_s == pytest.approx(1.0)
-    assert "flagged" in defend.format_ablation(ab)
+    text = defend.format_ablation(ab)
+    assert "flagged" in text and "spontaneous leaks (no guardrail): benign:bn-04:0" in text
+
+
+def test_benign_redaction_of_non_leaking_reply_is_a_false_positive() -> None:
+    frag = item("benign:bn-01:0", reply=f"ref {CORE[:6]} ok", set_name="benign")
+    assert frag.output.redacted and not judge.detect(CANARY, frag.reply).leaked
+    rows = {r.config: r for r in ablate([frag]).benign}
+    assert rows["c"].false_positive.k == 1 and rows["c"].spontaneous_leak.k == 0
+    assert rows["c"].flagged == rows["c"].flagged_v1 == ("benign:bn-01:0",)
+
+
+def test_latency_excludes_network_stalls_of_the_comparison_classifier() -> None:
+    from dataclasses import replace
+
+    def pg(lat: float) -> ClassifierDecision:
+        return ClassifierDecision("safe", False, "0.1", lat, "groq/pg", 0.1)
+
+    items = [
+        replace(item(f"dev:x{i}:0", reply=CLEAN), comparison=pg(lat))
+        for i, lat in enumerate([0.2, 0.2, 0.2, defend.NETWORK_STALL_S + 30])
+    ]
+    ab = ablate(items)
+    rows = {r.config: r for r in ab.attacks}
+    p = rows["p"].latency
+    assert p.stalled == 1 and p.p95_s > defend.NETWORK_STALL_S
+    assert p.p95_excl_stalls_s == pytest.approx(0.2) and p.mean_excl_stalls_s == pytest.approx(0.2)
+    assert rows["a+b"].latency.stalled == 0  # p never ran
+    assert ab.layer_latency["p"]["over_stall_threshold"] == 1
+    assert ab.layer_latency["p"]["max_excl_over_threshold_s"] == pytest.approx(0.2)
+    d = ab.to_dict()
+    assert d["fp_definition"] == 2 and d["attacks"][0]["stalled"] == 0
+
+
+def test_block_rate_interval_resamples_prompts() -> None:
+    # one prompt blocked on all 3 trials, one never: the cluster CI spans prompts, not trials
+    items = [item(f"dev:{x}:{t}", a=(x == "x1"), item_id=x) for x in ("x1", "x2") for t in range(3)]
+    row = {r.config: r for r in ablate(items).attacks}["a"]
+    assert row.blocked.k == 3 and row.blocked_cluster_ci == (0.0, 1.0)
+    assert {r.config: r for r in ablate(items).attacks}["none"].blocked_cluster_ci == (0.0, 0.0)
 
 
 def test_items_from_records_dedupes_and_recomputes_pure_layers() -> None:
