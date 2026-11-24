@@ -9,7 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from . import baseline, defend, judge, labelling, report, truncation
+from . import baseline, defend, judge, labelling, report, truncation, verdicts
 from .benign import BenignError, BenignSet, load_benign
 from .config import ConfigError, load_config
 from .guardrail import (
@@ -316,6 +316,9 @@ def cmd_labels(cfg: dict[str, Any], action: str, run_id: str, *, force: bool) ->
 def cmd_report(cfg: dict[str, Any], *, baseline_run: str | None) -> int:
     """Regenerate the numbers in README.md from the run logs and result files."""
     rc = cfg.get("report", {})
+    if rc.get("enabled") is False:
+        _err(f"report is disabled in this config: {rc.get('reason', 'see the config')}")
+        return 2
     run_id = baseline_run or rc.get("baseline_run")
     if not run_id:
         _err("no baseline run: pass --baseline RUN_ID or set report.baseline_run in config.yaml")
@@ -343,6 +346,7 @@ def cmd_report(cfg: dict[str, Any], *, baseline_run: str | None) -> int:
                 dev_sets=list(d.get("dev_sets", [])),
                 heldout_sets=list(d.get("heldout_sets", [])),
                 headline_sets=d.get("headline_sets"),
+                aware_sets=[CUSTOM_SET],
             )
             if rc.get("guardrail_ablation")
             else report.PENDING
@@ -479,10 +483,28 @@ def cmd_truncation(
 ABLATION_FILE = "ablation.json"
 
 
+CUSTOM_SET = "custom"  # defend.heldout_custom: owner-written, guardrail-aware, reported apart
+CUSTOM_PREFIX = "ch-"
+
+
+def _load_custom(path: str) -> SeedSet:
+    """The owner's custom held-out set (seeds.yaml format, ids ``ch-NN``).
+
+    Raises:
+        SeedError: If the file is malformed or an id lacks the ``ch-`` prefix.
+    """
+    s = load_seeds(path)
+    bad = [x.id for x in s.seeds if not x.id.startswith(CUSTOM_PREFIX)]
+    if bad:
+        raise SeedError(f"{path}: custom set ids must start with {CUSTOM_PREFIX!r} (got {bad})")
+    return s
+
+
 def _defend_inputs(
     cfg: dict[str, Any],
-) -> tuple[SeedSet, dict[str, HeldoutSet], BenignSet, BenignSet | None] | None:
-    """Load the dev seeds, every held-out attack file, and both benign sets (None on error)."""
+) -> tuple[SeedSet, dict[str, HeldoutSet], BenignSet, BenignSet | None, SeedSet | None] | None:
+    """Load the dev seeds, every held-out attack file, both benign sets and the optional
+    custom set (None on error)."""
     d = cfg.get("defend", {})
     seeds = _load_seeds(cfg)
     if seeds is None:
@@ -502,18 +524,24 @@ def _defend_inputs(
         benign = load_benign(d.get("benign_file", "data/benign.yaml"))
         hb_path = d.get("heldout_benign_file")
         hbenign = load_benign(hb_path) if hb_path else None
-    except (HeldoutError, BenignError) as e:
+        custom = _load_custom(d["heldout_custom"]) if d.get("heldout_custom") else None
+    except (HeldoutError, BenignError, SeedError) as e:
         _err(str(e))
         return None
     wrong = [n for n, s in heldout.items() if s.name != n]
     if wrong:
         _err(f"held-out file name field differs from its config key: {wrong}")
         return None
-    return seeds, heldout, benign, hbenign
+    return seeds, heldout, benign, hbenign, custom
 
 
 def _defend_meta(
-    cfg: dict[str, Any], heldout: dict[str, HeldoutSet], benign: BenignSet, hb: BenignSet | None
+    cfg: dict[str, Any],
+    heldout: dict[str, HeldoutSet],
+    benign: BenignSet,
+    hb: BenignSet | None,
+    custom: SeedSet | None = None,
+    reuse_from: list[str] | None = None,
 ) -> dict[str, Any]:
     """What a defend run's results depend on beyond the run fingerprint (checked on resume)."""
     d = cfg["defend"]
@@ -533,6 +561,8 @@ def _defend_meta(
         },
         "benign_sha256": benign.sha256,
         "heldout_benign_sha256": hb.sha256 if hb else None,
+        "custom": {"sha256": custom.sha256, "n": len(custom.seeds)} if custom else None,
+        "reuse_verdicts_from": list(reuse_from or []),
     }
 
 
@@ -543,12 +573,17 @@ def _defend_live(
     limit: int | None,
     allow_dirty: bool,
     config_path: str | None,
+    reuse_from: list[str] | None = None,
 ) -> int:
-    """Live paired ablation: dev seeds + held-out attack sets + both benign sets."""
+    """Live paired ablation: dev seeds + held-out attack sets + custom set + both benign sets.
+
+    With ``reuse_from`` (defend run ids), (b)/(p) decisions logged there for the same prompt,
+    classifier model, guardrail and seed are reused instead of calling the classifiers.
+    """
     inputs = _defend_inputs(cfg)
     if inputs is None:
         return 2
-    seeds, heldout, benign, hbenign = inputs
+    seeds, heldout, benign, hbenign, custom = inputs
     d, g = cfg["defend"], cfg.get("guardrail", {})
     if not allow_dirty and environment_info().get("git_dirty"):
         _err("the git tree has uncommitted changes (commit first, or pass --allow-dirty)")
@@ -560,12 +595,33 @@ def _defend_live(
     }
     if "seeds" in d.get("dev_sets", []):
         sets["seeds"] = [(s.id, s.family, s.prompt) for s in seeds.seeds]
+    if custom is not None:
+        sets[CUSTOM_SET] = [(s.id, s.family, s.prompt) for s in custom.seeds]
     work = defend.attack_work(sets, trials)
     bt = d.get("benign_trials", 1)
     work += defend.benign_work(benign, bt)
     if hbenign is not None:
         work += defend.benign_work(hbenign, bt, set_name=defend.HELDOUT_BENIGN_SET)
-    meta = _defend_meta(cfg, heldout, benign, hbenign)
+    meta = _defend_meta(cfg, heldout, benign, hbenign, custom, reuse_from)
+    reuse = None
+    if reuse_from:
+        try:
+            reuse = verdicts.VerdictStore.from_runs(
+                [RunDir.open(_runs_root(cfg), r) for r in reuse_from],
+                guardrail_sha=meta["guardrail"]["sha256"],
+                models=verdicts.layer_models(cfg),
+            )
+        except (verdicts.VerdictError, RunError) as e:
+            _err(f"--reuse-verdicts: {e}")
+            return 2
+        print(
+            f"reusing {len(reuse)} logged (b)/(p) decisions from {', '.join(reuse.sources)}"
+            + (
+                f" ({reuse.conflicts} conflicting duplicates, first kept)"
+                if reuse.conflicts
+                else ""
+            )
+        )
     comparison = None
     try:  # before the run dir exists, so a missing key doesn't leave an empty run behind
         if cfg.get("comparison_classifier"):
@@ -591,7 +647,8 @@ def _defend_live(
         _err(str(e))
         return 2
     cfg_flag = f" --config {config_path}" if config_path else ""
-    hint = f"python -m redevolve defend --resume {run.run_id}{cfg_flag}"
+    reuse_flag = f" --reuse-verdicts {' '.join(reuse_from)}" if reuse_from else ""
+    hint = f"python -m redevolve defend --resume {run.run_id}{cfg_flag}{reuse_flag}"
     n_att = sum(len(v) for v in sets.values())
     print(
         f"run {run.run_id}: {n_att} attacks ({', '.join(f'{k} {len(v)}' for k, v in sets.items())})"
@@ -611,6 +668,7 @@ def _defend_live(
             comparison=comparison,
             run_seed=cfg["seed"],
             limit=limit,
+            reuse=reuse,
         )
     except LLMError as e:
         _err(f"a model call failed ({type(e).__name__}: {e}); run paused. Then: {hint}")
@@ -644,7 +702,18 @@ def _defend_summarize(cfg: dict[str, Any], run: RunDir) -> int:
         n_boot=cfg.get("baseline", {}).get("bootstrap_resamples", 10_000),
     )
     print("\n" + defend.format_ablation(ab))
-    data = {**ab.to_dict(), "guardrail": run.meta.get("guardrail") or guardrail_fingerprint(cfg)}
+    evs = list(run.records("eval"))
+    reused = {
+        f: sum(f in (r.get("reused") or {}) for r in evs) for f in verdicts.LAYER_FIELDS.values()
+    }
+    if any(reused.values()):
+        print(f"reused decisions (not re-classified): {reused} of {len(evs)} items")
+    data = {
+        **ab.to_dict(),
+        "guardrail": run.meta.get("guardrail") or guardrail_fingerprint(cfg),
+        "target_model": run.meta.get("fingerprint", {}).get("target_model"),
+        "reused_verdicts": {**reused, "items": len(evs)},
+    }
     out = run.path / ABLATION_FILE
     out.write_text(json.dumps(data, indent=2), encoding="utf-8")
     print(f"\nwritten to {out}; set report.guardrail_ablation to it, then run `report`")
@@ -660,6 +729,7 @@ def cmd_defend(
     allow_dirty: bool = False,
     config_path: str | None = None,
     summarize: str | None = None,
+    reuse_from: list[str] | None = None,
 ) -> int:
     """Paired guardrail ablation: live (default), ``--summarize RUN_ID`` or ``--offline``.
 
@@ -672,7 +742,12 @@ def cmd_defend(
         return 2 if run is None else _defend_summarize(load_config(run.path / CONFIG_FILE), run)
     if offline is None:
         return _defend_live(
-            cfg, resume=resume, limit=limit, allow_dirty=allow_dirty, config_path=config_path
+            cfg,
+            resume=resume,
+            limit=limit,
+            allow_dirty=allow_dirty,
+            config_path=config_path,
+            reuse_from=reuse_from,
         )
     run = _open_run(cfg, offline)
     if run is None:
@@ -725,6 +800,43 @@ def cmd_defend(
     return 0
 
 
+def cmd_verdicts_check(cfg: dict[str, Any], run_id: str, *, n: int) -> int:
+    """Determinism check of a defend run's (b)/(p) decisions before they are reused."""
+    run = _open_run(cfg, run_id)
+    if run is None:
+        return 2
+    rcfg = load_config(run.path / CONFIG_FILE)
+    fp = guardrail_fingerprint(rcfg)
+    if fp["sha256"] != (run.meta.get("guardrail") or {}).get("sha256"):
+        _err(f"{run_id}: its guardrail fingerprint differs from the current code; can't check")
+        return 2
+    comparison = None
+    if rcfg.get("comparison_classifier"):
+        key = load_groq_key()
+        if not key:
+            _err("comparison classifier needs GROQ_API_KEY (in .env)")
+            return 2
+        comparison = PromptGuardClassifier.from_config(rcfg, key)
+    print(f"re-classifying {n} logged items of {run_id} (guardrail {fp['sha256'][:12]})")
+    try:
+        res = verdicts.check_determinism(
+            run,
+            InjectionClassifier.from_config(rcfg),
+            comparison,
+            guardrail_sha=fp["sha256"],
+            n=n,
+        )
+    except LLMError as e:
+        _err(f"a classifier call failed ({type(e).__name__}: {e}); nothing written")
+        return 1
+    print(
+        f"(b) {res['b_matches']}/{res['n']} match, (p) {res['p_matches']}/{res['p_checked']} "
+        f"match -> {'PASSED' if res['passed'] else 'FAILED (reuse refused for this run)'}; "
+        f"written to {run.path / verdicts.CHECK_FILE}"
+    )
+    return 0 if res["passed"] else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point for ``redevolve`` / ``python -m redevolve``; returns a process exit code."""
     p = argparse.ArgumentParser(prog="redevolve")
@@ -760,6 +872,17 @@ def main(argv: list[str] | None = None) -> int:
     de.add_argument("--limit", type=int, metavar="N", help="pause after N new evaluations")
     de.add_argument("--allow-dirty", action="store_true", help="allow uncommitted changes")
     de.add_argument("--summarize", metavar="RUN_ID", help="re-ablate a defend run's log")
+    de.add_argument(
+        "--reuse-verdicts",
+        nargs="+",
+        metavar="RUN_ID",
+        help="reuse (b)/(p) decisions logged in these defend runs (each needs `verdicts check`)",
+    )
+    ve = sub.add_parser("verdicts", help="input-side verdict reuse across target models")
+    vsub = ve.add_subparsers(dest="verdicts_cmd", required=True)
+    vc = vsub.add_parser("check", help="re-classify a fixed sample of a run; must all match")
+    vc.add_argument("run_id")
+    vc.add_argument("--n", type=int, default=verdicts.CHECK_N, help="sample size")
     args = p.parse_args(argv)
     try:
         cfg = load_config(args.config)
@@ -815,7 +938,10 @@ def main(argv: list[str] | None = None) -> int:
             allow_dirty=args.allow_dirty,
             config_path=args.config,
             summarize=args.summarize,
+            reuse_from=args.reuse_verdicts,
         )
+    if args.cmd == "verdicts":
+        return cmd_verdicts_check(cfg, args.run_id, n=args.n)
     return 1
 
 

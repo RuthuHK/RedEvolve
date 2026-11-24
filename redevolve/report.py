@@ -444,6 +444,7 @@ def guardrail_section(
     dev_sets: list[str],
     heldout_sets: list[str],
     headline_sets: list[str] | None = None,
+    aware_sets: list[str] | None = None,
 ) -> str:
     """Markdown for the paired guardrail ablation (``Ablation.to_dict()`` JSON).
 
@@ -467,13 +468,15 @@ def guardrail_section(
             "run (python -m redevolve defend --summarize RUN_ID)"
         )
     sets = list(dict.fromkeys(r["set"] for r in ab["attacks"]))
-    undeclared = [s for s in sets if s not in dev_sets and s not in heldout_sets]
+    aware = list(aware_sets or [])
+    undeclared = [s for s in sets if s not in dev_sets and s not in heldout_sets and s not in aware]
     if undeclared:
         raise ReportError(f"attack sets not declared as dev or held-out in config: {undeclared}")
     lines: list[str] = []
     if "guardrail" in ab:
         g = ab["guardrail"]
-        lines += [f"Guardrail v{g['version']} (`{g['sha256'][:12]}`).", ""]
+        target = f" Target: `{ab['target_model']}`." if ab.get("target_model") else ""
+        lines += [f"Guardrail v{g['version']} (`{g['sha256'][:12]}`).{target}", ""]
     headline = heldout_sets if headline_sets is None else headline_sets
     bad = [s for s in headline if s not in heldout_sets]
     if bad:
@@ -484,6 +487,11 @@ def guardrail_section(
         (
             "Held-out variant (reported separately, not the headline)",
             [s for s in heldout_sets if s not in headline],
+        ),
+        (
+            "Guardrail-aware held-out set (not used in design, but written by someone who knows "
+            "the guardrail; reported separately)",
+            aware,
         ),
         ("Dev attacks (the guardrail was designed while reading these: optimistic)", dev_sets),
     ):

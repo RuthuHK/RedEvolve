@@ -8,7 +8,8 @@ from redevolve import cli
 from redevolve.config import load_config
 from tests.helpers import FakeClock
 
-_REPO_CONFIG = Path(__file__).resolve().parent.parent / "config.yaml"
+_REPO = Path(__file__).resolve().parent.parent
+_CONFIGS = [_REPO / "config.yaml", *sorted((_REPO / "configs").glob("*.yaml"))]
 
 
 @pytest.fixture
@@ -17,18 +18,30 @@ def clock() -> FakeClock:
     return FakeClock()
 
 
+def _owner_files() -> set[Path]:
+    """The owner's private files named in any repo config (resolved, never opened)."""
+    out: set[Path] = set()
+    for c in _CONFIGS:
+        d = load_config(c).get("defend", {})
+        for key in ("heldout_benign_file", "heldout_custom"):
+            if d.get(key):
+                out.add(Path(d[key]).resolve())
+    return out
+
+
 @pytest.fixture(autouse=True)
-def _never_read_heldout_benign(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The owner's held-out benign file is read only by the real evaluation run, never by tests."""
-    configured = load_config(_REPO_CONFIG).get("defend", {}).get("heldout_benign_file")
-    if not configured:
+def _never_read_owner_files(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The owner's held-out benign file and custom attack set are read only by the real
+    evaluation runs, never by tests."""
+    forbidden = _owner_files()
+    if not forbidden:
         return
-    forbidden = Path(configured).resolve()
-    real = cli.load_benign
+    for name in ("load_benign", "load_seeds"):
+        real = getattr(cli, name)
 
-    def guarded(path):  # type: ignore[no-untyped-def]
-        if Path(path).resolve() == forbidden:
-            raise AssertionError("a test tried to load the owner's held-out benign file")
-        return real(path)
+        def guarded(path, _real=real):  # type: ignore[no-untyped-def]
+            if Path(path).resolve() in forbidden:
+                raise AssertionError("a test tried to load one of the owner's private files")
+            return _real(path)
 
-    monkeypatch.setattr(cli, "load_benign", guarded)
+        monkeypatch.setattr(cli, name, guarded)

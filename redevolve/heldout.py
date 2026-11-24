@@ -16,6 +16,15 @@ v1 (decided 2026-11-19/20, before any held-out evaluation):
   set, the classifier's examples and the classifier check prompts).
 - Two variants of the same filtered rows: ``verbatim`` (headline) and ``password-to-code``
   (:func:`password_to_code`), reported separately.
+
+v1.1 (decided 2026-11-23/24, before any v1.1 run): Tensor Trust's extraction-robustness
+benchmark has no licence, so its texts are never committed. The repo holds an **id manifest**
+(``kind: manifest``): the pinned source, the sampling rule, and per attack its ``sample_id`` and
+the sha256 of its text. :func:`load_manifest` rebuilds the texts from a local copy of the pinned
+file (``scripts/build_tensortrust.py --fetch``) and checks every hash. Filters: the v1 filters
+plus ``too_long`` (more than ``max_chars`` characters) after ``canary_like``, with the Gandalf
+prompts added to the overlap texts; then a sample of ``n`` attacks, ordered by
+``sha256(salt + "|" + sample_id)``.
 """
 
 from __future__ import annotations
@@ -139,10 +148,18 @@ class FilterResult:
     dropped: dict[str, list[int]]
 
 
-def filter_rows(rows: list[str], dev_texts: Iterable[str]) -> FilterResult:
-    """Apply the pre-registered filters (module docstring) in order. Pure; no I/O."""
+def filter_rows(
+    rows: list[str], dev_texts: Iterable[str], *, max_chars: int | None = None
+) -> FilterResult:
+    """Apply the pre-registered filters (module docstring) in order. Pure; no I/O.
+
+    With ``max_chars``, a ``too_long`` filter runs after ``canary_like`` (v1.1 sets only).
+    """
     dev = set().union(*(shingles(t) for t in dev_texts))
-    dropped: dict[str, list[int]] = {"empty": [], "canary_like": [], "duplicate": [], "overlap": []}
+    dropped: dict[str, list[int]] = {"empty": [], "canary_like": []}
+    if max_chars is not None:
+        dropped["too_long"] = []
+    dropped |= {"duplicate": [], "overlap": []}
     seen: set[str] = set()
     kept: list[tuple[int, str]] = []
     for i, raw in enumerate(rows):
@@ -151,6 +168,8 @@ def filter_rows(rows: list[str], dev_texts: Iterable[str]) -> FilterResult:
             dropped["empty"].append(i)
         elif _CANARY_VALUE_RE.search(text):
             dropped["canary_like"].append(i)
+        elif max_chars is not None and len(text) > max_chars:
+            dropped["too_long"].append(i)
         elif normalise(text) in seen:
             dropped["duplicate"].append(i)
         elif shingles(text) & dev:
@@ -205,19 +224,29 @@ def dump_set(s: HeldoutSet, path: str | Path, *, header: str = "") -> None:
     Path(path).write_text(header + body, encoding="utf-8")
 
 
-def load_heldout(path: str | Path) -> HeldoutSet:
-    """Load and validate a held-out attack file; the stored hash must match the content.
-
-    Raises:
-        HeldoutError: On any problem (all listed).
-    """
-    p = Path(path)
+def _read_yaml(p: Path) -> dict[str, Any]:
     try:
         data = yaml.safe_load(p.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as e:
         raise HeldoutError(f"cannot read held-out file {p}: {e}") from e
     if not isinstance(data, dict):
         raise HeldoutError(f"{p}: top level must be a mapping")
+    return data
+
+
+def load_heldout(path: str | Path) -> HeldoutSet:
+    """Load and validate a held-out attack file; the stored hash must match the content.
+
+    An id manifest (``kind: manifest``) is rebuilt from its local source copy instead, see
+    :func:`load_manifest`.
+
+    Raises:
+        HeldoutError: On any problem (all listed).
+    """
+    p = Path(path)
+    data = _read_yaml(p)
+    if data.get("kind") == MANIFEST_KIND:
+        return load_manifest(p)
     problems: list[str] = []
     name, version, transform = data.get("name"), data.get("version"), data.get("transform")
     if not isinstance(name, str) or not name:
@@ -259,6 +288,188 @@ def load_heldout(path: str | Path) -> HeldoutSet:
         str(transform),
         tuple(attacks),
         dict(data.get("source") or {}),
+        dict(data.get("filters") or {}),
+        digest,
+    )
+
+
+# --- id manifests (v1.1: sources whose texts may not be redistributed) ------------------
+
+MANIFEST_KIND = "manifest"
+
+
+def text_sha256(text: str) -> str:
+    """SHA-256 of one prompt's UTF-8 text (as used in the set, after stripping)."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def file_sha256(path: str | Path) -> str:
+    """SHA-256 of a file's bytes."""
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def sample_order(salt: str, sample_id: str | int) -> str:
+    """The pre-registered sampling order key: ``sha256(salt + "|" + sample_id)``."""
+    return hashlib.sha256(f"{salt}|{sample_id}".encode()).hexdigest()
+
+
+def manifest_hash(
+    name: str, version: int, transform: str, entries: Iterable[dict[str, Any]]
+) -> str:
+    """SHA-256 over a manifest's name, version, transform and id/family/sample_id/text hash."""
+    canonical = {
+        "name": name,
+        "version": version,
+        "transform": transform,
+        "attacks": [
+            {k: e[k] for k in ("id", "family", "sample_id", "prompt_sha256")} for e in entries
+        ],
+    }
+    blob = json.dumps(canonical, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def read_jsonl(path: str | Path, *, id_field: str, text_field: str) -> list[tuple[str, str]]:
+    """(sample_id as str, text) per non-empty JSONL line, in file order.
+
+    Raises:
+        HeldoutError: If the file can't be read or a line lacks a field.
+    """
+    out: list[tuple[str, str]] = []
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError as e:
+        raise HeldoutError(f"cannot read {path}: {e}") from e
+    for n, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+            out.append((str(row[id_field]), str(row[text_field] or "")))
+        except (ValueError, KeyError, TypeError) as e:
+            raise HeldoutError(f"{path}: line {n + 1}: {e}") from e
+    return out
+
+
+def build_manifest(
+    name: str,
+    id_prefix: str,
+    family: str,
+    rows: list[tuple[str, str]],
+    *,
+    dev_texts: Iterable[str],
+    n: int,
+    salt: str,
+    max_chars: int,
+    source: dict[str, Any],
+) -> tuple[dict[str, Any], HeldoutSet]:
+    """Filter, sample and freeze ``rows`` (sample_id, text) as an id manifest (+ the set).
+
+    The ``n`` kept rows first in :func:`sample_order` are taken and listed in file order, with
+    ids ``<prefix>-000`` onwards. Pure; the caller writes the manifest.
+    """
+    fr = filter_rows([t for _, t in rows], dev_texts, max_chars=max_chars)
+    ranked = sorted(fr.kept, key=lambda it: sample_order(salt, rows[it[0]][0]))
+    chosen = sorted(ranked[:n])
+    if len(chosen) < n:
+        raise HeldoutError(f"only {len(chosen)} rows left after filtering, need {n}")
+    attacks = tuple(
+        HeldoutAttack(f"{id_prefix}-{k:03d}", family, text, row)
+        for k, (row, text) in enumerate(chosen)
+    )
+    entries = [
+        {
+            "id": a.id,
+            "family": a.family,
+            "sample_id": rows[a.source_row][0],
+            "source_row": a.source_row,
+            "prompt_sha256": text_sha256(a.prompt),
+        }
+        for a in attacks
+    ]
+    filters = {
+        "rows": len(rows),
+        "dropped": {k: len(v) for k, v in fr.dropped.items()},
+        "kept": len(fr.kept),
+        "sampled": n,
+    }
+    digest = content_hash(name, VERSION, "verbatim", attacks)
+    manifest = {
+        "version": VERSION,
+        "name": name,
+        "kind": MANIFEST_KIND,
+        "transform": "verbatim",
+        "manifest_sha256": manifest_hash(name, VERSION, "verbatim", entries),
+        "set_sha256": digest,
+        "source": source,
+        "sampling": {
+            "n": n,
+            "salt": salt,
+            "order": "sha256(salt|sample_id)",
+            "max_chars": max_chars,
+        },
+        "filters": filters,
+        "attacks": entries,
+    }
+    hs = HeldoutSet(name, VERSION, "verbatim", attacks, source, filters, digest)
+    return manifest, hs
+
+
+def dump_manifest(manifest: dict[str, Any], path: str | Path, *, header: str = "") -> None:
+    """Write an id manifest as YAML."""
+    body = yaml.safe_dump(manifest, sort_keys=False, allow_unicode=True, width=100)
+    Path(path).write_text(header + body, encoding="utf-8")
+
+
+def load_manifest(path: str | Path, *, source_file: str | Path | None = None) -> HeldoutSet:
+    """Rebuild a held-out set from an id manifest and a local copy of its pinned source.
+
+    ``source_file`` defaults to the manifest's ``source.cache_path`` (relative to the working
+    directory). Checks, in order: the manifest's own hash, the source file's sha256, that every
+    ``sample_id`` exists, every text's sha256, and the rebuilt set's content hash.
+
+    Raises:
+        HeldoutError: On any mismatch, or if the source file is missing (with a fetch hint).
+    """
+    p = Path(path)
+    data = _read_yaml(p)
+    name, version, transform = data.get("name"), data.get("version"), data.get("transform")
+    entries = data.get("attacks")
+    src = data.get("source") or {}
+    if not isinstance(entries, list) or not entries or not isinstance(name, str):
+        raise HeldoutError(f"{p}: a manifest needs 'name' and a non-empty 'attacks' list")
+    try:
+        if data.get("manifest_sha256") != manifest_hash(name, version, transform, entries):
+            raise HeldoutError(f"{p}: stored manifest_sha256 does not match (edited by hand?)")
+    except (KeyError, TypeError) as e:
+        raise HeldoutError(f"{p}: malformed manifest entry: {e}") from e
+    f = Path(source_file or src.get("cache_path", ""))
+    if not f.is_file():
+        raise HeldoutError(
+            f"{p}: source file {f} not found; rebuild it locally with "
+            "`python scripts/build_tensortrust.py --fetch` (the texts are not redistributed)"
+        )
+    if file_sha256(f) != src.get("sha256"):
+        raise HeldoutError(f"{f}: sha256 differs from the pinned source in {p}")
+    texts = dict(read_jsonl(f, id_field=src["id_field"], text_field=src["text_field"]))
+    attacks: list[HeldoutAttack] = []
+    for e in entries:
+        text = texts.get(str(e["sample_id"]))
+        if text is None:
+            raise HeldoutError(f"{p}: sample_id {e['sample_id']} not in {f}")
+        text = text.strip()
+        if text_sha256(text) != e["prompt_sha256"]:
+            raise HeldoutError(f"{p}: text of {e['id']} does not match its sha256")
+        attacks.append(HeldoutAttack(e["id"], e["family"], text, int(e["source_row"])))
+    digest = content_hash(name, int(version), str(transform), attacks)
+    if digest != data.get("set_sha256"):
+        raise HeldoutError(f"{p}: rebuilt set hash differs from set_sha256")
+    return HeldoutSet(
+        name,
+        int(version),
+        str(transform),
+        tuple(attacks),
+        dict(src),
         dict(data.get("filters") or {}),
         digest,
     )

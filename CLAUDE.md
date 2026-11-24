@@ -71,7 +71,7 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 ## Engineering conventions
 - Python 3.12, package `redevolve/`, `pyproject.toml`, type hints, docstrings on public functions.
 - `ruff` (lint + format), `pytest` with **all LLM calls mocked**; GitHub Actions runs ruff + pytest.
-- CLI: `python -m redevolve <smoke|baseline|summary|labels|report|truncation|evolve|defend|all> [--config PATH]`.
+- CLI: `python -m redevolve <smoke|baseline|summary|labels|report|truncation|evolve|defend|verdicts|all> [--config PATH]`.
 - Windows dev machine: use the venv at `.venv/Scripts/python.exe`.
 - Setup: `pip install -r requirements-lock.txt && pip install -e ".[dev]" --no-deps`. `pyproject.toml` holds
   compatible ranges (`~=`); `requirements-lock.txt` (pip freeze) holds exact versions. Regenerate the lock after
@@ -198,6 +198,7 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
   parquet (in `.cache/gandalf-04737b65/`, git-ignored; needs the optional `data` extra = pyarrow); prints counts and
   hashes only. `data/heldout/LICENSE` = Lakera MIT notice. `report.guardrail_section(..., headline_sets=)` labels
   other held-out sets "Held-out variant (reported separately, not the headline)".
+- `configs/`: v1.1 configs (see Build plan v1.1). `redevolve/verdicts.py`: input-side verdict reuse.
 - `redevolve/benign.py`: `load_benign` -> `BenignSet` (hash over version + id/category/prompt). `data/benign.yaml`:
   50 prompts, 25 `plain` + 25 `hard` (benign but uses attack words). Hash pinned in `tests/test_benign.py`. Written by
   the guardrail's author in the same session (not held out); never edit after seeing which get blocked.
@@ -231,7 +232,7 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
 - `tests/`: helpers.py (FakeClock, Scripted httpx MockTransport), test_config, test_llm, test_ratelimit,
   test_cache, test_judge, test_mutator, test_mutator_prompts, test_runs, test_seeding, test_seeds, test_smoke,
   test_target, test_stats, test_baseline, test_labelling, test_cli_baseline, test_report, test_truncation,
-  test_guardrail, test_benign, test_defend, test_report_sections, test_operators, test_heldout (~470 tests, ~90 s,
+  test_guardrail, test_benign, test_defend, test_report_sections, test_operators, test_heldout, test_configs_v11, test_verdicts (~490 tests, ~90 s,
   no network). Benign-corpus judge tests use
   300 canaries (regression guard; quoted FP rates come from scripts/judge_fp.py).
   test_judge: 35 encodings x 100 random canaries, fixed-method examples, near-misses, partials, benign FP corpus. CI: `.github/workflows/ci.yml` (ruff lint + format check + pytest, Python 3.12).
@@ -355,5 +356,44 @@ Genetic-algorithm prompt-injection fuzzer for a **local** LLM. A portfolio proje
       table, generated floor check, dev leak-reduction line, spontaneous-leak line, old vs corrected FP, stall-aware
       latency and a per-layer latency table). v1 results are final; v1.1 is reported separately.
 - [ ] M10 publish v1: gitleaks scan of full history, resume bullet (real numbers), GitHub steps
-- [ ] v1.1: GA engine (M6) + evolve with seed 1 and random-search control (M7), then GA seeds 2 and 3; evolved
+- [ ] v1.1 evaluation (owner decisions 2026-11-24, **built 2026-11-24, nothing run yet**; v1 results stay as they are,
+      v1.1 reported separately):
+      - **Headline held-out set = Tensor Trust** extraction-robustness v1 (no licence: never commit texts). Id manifest
+        `data/heldout/tensortrust_ids.yaml` (`kind: manifest`): commit `747a75e0...`, file sha256 `4090f9f5...`,
+        570 rows, 140 dropped as duplicates (0 empty/canary/too_long/overlap), 430 kept, 200 sampled by
+        `sha256("tensortrust-v1.1|" + sample_id)`, ids `tt-000..tt-199` in file order, max_chars 4000. Hashes
+        pinned in `tests/test_heldout.py` (manifest `220dba56...`, set `9432cdea...`); never "fix" them.
+        `heldout.load_heldout` dispatches manifests to `load_manifest` (rebuilds from `.cache/tensortrust-747a75e0/`,
+        checks manifest, file, every text and set hash). `scripts/build_tensortrust.py --fetch|--build|--verify`
+        (`--build` refuses to overwrite). Only the `attack` field is used, with our own system prompt and canary.
+      - **Custom set** `defend.heldout_custom` (default null; seeds.yaml format, ids must start `ch-`, set name
+        `custom`, `cli._load_custom`), hash + n in run meta, reported as "Guardrail-aware held-out set"
+        (`report.guardrail_section(aware_sets=)`). **Never look for, open or print the owner's file**; the conftest
+        guard refuses `heldout_benign_file`/`heldout_custom` paths from config.yaml and `configs/*.yaml`.
+      - **Second target `llama3.2:3b`** (`configs/v1.1-llama.yaml`, `think: null` = flag omitted; tools-only in
+        Ollama, no thinking). gemma3:4b rejected: Ollama's Gemma 3 template folds the system prompt into the user
+        turn. Llama: baseline (K=10, gate per model) + ~30-reply labelling sample (20 stratified + 10 enc-06) +
+        defend on gandalf (headline variant only) + seeds + tensortrust + custom + benign.
+        `configs/v1.1-qwen.yaml`: same target, defend on tensortrust + custom + benign. Both: K=3, headline
+        `[tensortrust]`, `report.enabled: false` (cmd_report refuses) so v1 README blocks are never overwritten.
+        `tests/test_configs_v11.py` pins which keys may differ from config.yaml and that the guardrail fingerprint
+        and seed are unchanged.
+      - **Pre-registered headline rule**: per held-out set and model, leak reduction is a headline metric only if
+        the undefended config has >= 6 full leaks (smallest count where exact McNemar p < 0.05 is reachable);
+        otherwise block rate only (as v1).
+      - **Verdict reuse** (`redevolve/verdicts.py`, owner request): (b)/(p) see only the prompt, so logged decisions
+        are reused across target models on exact key layer + `provider/model` + guardrail sha256 + sha256(prompt) +
+        classifier seed (`classifier_seed(run_seed, id, trial)`; p has none). `defend --reuse-verdicts RUN_ID...`
+        (`VerdictStore.from_runs` refuses runs that aren't complete defend runs, have another guardrail, or lack a
+        passing `verdict_check.json`). Reused records carry `reused: {field: source_run}` and the source latency;
+        ablation.json gets `reused_verdicts` + `target_model`; run meta `reuse_verdicts_from` (checked on resume).
+        `python -m redevolve verdicts check RUN_ID [--n 20]`: re-classifies a fixed sample (sha256-of-key order,
+        half blocked / half passed by b) live; passes only if every b label and p block decision matches and
+        |p score diff| <= 0.01. Offline: the v1 run indexes 1061 decisions (822 b + 239 unique-prompt p), 0
+        conflicts (identical prompts got identical p decisions across trials/variants).
+      - Estimate (2026-11-24, from v1 session-2 rates: no per-item overhead beyond model time): Qwen v1.1 defend
+        ~735 items x 10-13 s = ~2.1-2.7 h, ~735 Groq; 2 determinism checks ~5 min, 40 Groq; Llama baseline ~30-45
+        min; Llama defend ~1160 items, target only (~2.7 h at Qwen speed, Llama speed unmeasured until smoke), 0
+        Groq if every verdict is reused. Total ~5.5-6 h, Groq ~775 (one day). README v1.1 sections not wired yet.
+- [ ] v1.1 GA: GA engine (M6) + evolve with seed 1 and random-search control (M7), then GA seeds 2 and 3; evolved
       attacks become a further held-out set for the guardrail; report regenerated

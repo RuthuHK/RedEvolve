@@ -389,12 +389,18 @@ All layer combinations are judged on the same target replies (one call per attac
   improvement comes from selection rather than from simply trying more prompts.
 - The evolved attacks would then be a second held-out set for the guardrail.
 - **Stronger held-out attack sets**, because the undefended target leaks too rarely on Gandalf
-  to measure leak reduction there: the extraction-robustness benchmark from
-  [Tensor Trust](https://arxiv.org/abs/2311.01011) (left out of v1 because no licence for the
-  data could be found, so it would be rebuilt locally rather than redistributed), and a custom
-  held-out set written by someone who has not seen the guardrail.
-- **A second target model**, run through the same baseline and guardrail pipeline and reported
-  per model. v1.1 results will be reported separately from the v1 results here.
+  to measure leak reduction there. The headline will be a fixed sample of the
+  extraction-robustness benchmark from [Tensor Trust](https://arxiv.org/abs/2311.01011). No
+  licence for that data could be found, so the repo holds only an id manifest
+  (`data/heldout/tensortrust_ids.yaml`: sample ids and text hashes, frozen before any run) and
+  `scripts/build_tensortrust.py` rebuilds the texts locally from a pinned commit. A second,
+  custom set is written by the project owner and reported separately as *guardrail-aware*:
+  it was not used to design the guardrail, but its author knows how the guardrail works.
+- **A second target model** (`llama3.2:3b`, `configs/v1.1-llama.yaml`), run through the same
+  baseline and guardrail pipeline and reported per model. The input-side layers only see the
+  prompt, so their logged decisions are reused across target models (exact match on prompt,
+  classifier model, guardrail version and seed, after a live determinism check on a sample).
+  v1.1 results will be reported separately from the v1 results here.
 
 ## Limitations
 

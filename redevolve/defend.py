@@ -67,6 +67,7 @@ from .runs import RunDir
 from .seeding import derive_seed, target_seed
 from .stats import Rate, cluster_bootstrap_ci, mcnemar_exact
 from .target import Target
+from .verdicts import VerdictStore, classifier_seed
 
 KIND = "defend"
 BENIGN_SET = "benign"  # dev benign set (data/benign.yaml), written alongside the guardrail
@@ -689,6 +690,7 @@ def run_defend(
     comparison: PromptGuardClassifier | None = None,
     run_seed: int,
     limit: int | None = None,
+    reuse: VerdictStore | None = None,
     log: Callable[[str], None] = print,
     clock: Callable[[], float] = time.monotonic,
 ) -> RunOutcome:
@@ -697,6 +699,10 @@ def run_defend(
 
     With ``comparison`` (Prompt Guard), each item also gets one comparison-classifier call,
     logged as ``comparison_classifier``; it never changes which target call is made.
+
+    With ``reuse``, a (b) or (p) decision already logged for the same prompt, classifier model,
+    guardrail and seed in an accepted source run is taken from there instead of calling the
+    classifier (see :mod:`redevolve.verdicts`); the record names the source under ``reused``.
 
     Raises:
         LLMError: If the target or a classifier fails; the run is marked ``paused`` first.
@@ -719,10 +725,20 @@ def run_defend(
                 run.set_status("paused", stopped_reason=f"--limit {limit}")
                 return RunOutcome(made, already + made, total, complete=False)
             a = input_filter.check(w.prompt)
-            b = classifier.check(
-                w.prompt, seed=derive_seed("classifier", run_seed, w.item_id, w.trial)
-            )
-            pg = comparison.check(w.prompt) if comparison is not None else None
+            seed_b = classifier_seed(run_seed, w.item_id, w.trial)
+            reused: dict[str, str] = {}
+            hit = reuse.get("b", w.prompt, seed=seed_b) if reuse is not None else None
+            if hit is not None:
+                b, reused["classifier"] = hit
+            else:
+                b = classifier.check(w.prompt, seed=seed_b)
+            pg = None
+            if comparison is not None:
+                hit = reuse.get("p", w.prompt, seed=None) if reuse is not None else None
+                if hit is not None:
+                    pg, reused["comparison_classifier"] = hit
+                else:
+                    pg = comparison.check(w.prompt)
             ev = target.evaluate(
                 w.item_id,
                 w.family,
@@ -740,6 +756,7 @@ def run_defend(
                     "classifier": b.to_dict(),
                     "output_filter": c.to_dict(),
                     **({"comparison_classifier": pg.to_dict()} if pg is not None else {}),
+                    **({"reused": reused} if reused else {}),
                 }
             )
             made += 1
@@ -758,8 +775,9 @@ def run_defend(
             log(
                 f"[{already + made:>4}/{total}] {w.set_name:<8} {w.item_id:<10} t{w.trial:<2} "
                 f"{'LEAK' if ev.verdict.leaked else '-':<4} layers {flags or '-':<3} "
-                f"target {ev.result.latency_s:5.1f}s clf {b.latency_s:4.1f}s  "
-                f"ETA {_fmt_duration(avg * remaining)}"
+                f"target {ev.result.latency_s:5.1f}s "
+                + ("clf reused " if "classifier" in reused else f"clf {b.latency_s:4.1f}s  ")
+                + f"ETA {_fmt_duration(avg * remaining)}"
             )
     except LLMError as e:
         run.set_status("paused", last_error=f"{type(e).__name__}: {e}")

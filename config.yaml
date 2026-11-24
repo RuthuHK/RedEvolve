@@ -120,6 +120,10 @@ defend:
   # data/benign.yaml; use ids that differ from bn-*, e.g. bh-01. null = none.
   heldout_benign_file: 'C:\Users\ruthu\Desktop\heldout_benign.yaml'
   benign_trials: 1
+  # v1.1 custom held-out set: written by the owner, kept outside the repo until its run, in the
+  # seeds.yaml format with ids ch-01, ch-02, ... Reported separately as "guardrail-aware" (set
+  # name `custom`): not used in design, but its author knows the guardrail. null = none.
+  heldout_custom: null
 
 report:                  # `python -m redevolve report` regenerates README numbers from these
   baseline_run: baseline-20261115-064359-s42
